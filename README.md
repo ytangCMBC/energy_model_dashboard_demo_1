@@ -1,10 +1,7 @@
 # Transit BEB Energy Dashboard (Demo)
 
 This repository contains a **lightweight demo** of the Transit Battery Electric Bus (BEB) Energy Dashboard.  
-It allows users to explore sample results through an interactive web app built with **Streamlit**.
-
-The **full simulation pipeline and large datasets remain private**.  
-This repo is designed for demonstration and deployment on **Streamlit Community Cloud**.
+It allows users to explore sample results through an interactive web app built with **Streamlit**. This repo is designed for demonstration and deployment on **Streamlit Community Cloud**.
 
 ---
 
