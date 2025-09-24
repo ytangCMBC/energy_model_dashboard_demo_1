@@ -240,7 +240,7 @@ with colC:
 with colD:
     st.metric("Original Bus Type", str(meta.get("Asset Class","N/A")))
 with colA:
-    st.metric("Travel Distance", f"{meta['distance_km']:.2f}")
+    st.metric("Travel Distance (km)", f"{meta['distance_km']:.2f}")
 
 
 
