@@ -13,9 +13,12 @@ from temp_3 import build_block_profile_with_charging
 # --------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------
-OUT_ROOT = Path("../data/processed")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUT_ROOT = PROJECT_ROOT / "data" / "processed"
+
 BLOCK_SUMMARY_PATH = OUT_ROOT / "block_success_summary_depot_only.parquet"
 CANDIDATE_STOP_MAP_PATH = OUT_ROOT / "candidate_stop_map.parquet"
+
 SOC_THRESHOLD_PERCENT = 20.0
 
 

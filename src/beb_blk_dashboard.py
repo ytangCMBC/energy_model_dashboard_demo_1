@@ -14,7 +14,8 @@ import plotly.graph_objects as go
 
 
 # ---------------------- Paths (match run_pipeline.py) ----------------------
-OUT_ROOT = Path("../data/processed")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUT_ROOT = PROJECT_ROOT / "data" / "processed"
 
 # Elevation
 ELEV_DIR_SERVICE   = OUT_ROOT / "elevation"
@@ -30,13 +31,13 @@ SIM_DEADHEAD = {
     "medium": OUT_ROOT / "deadhead" / "sim" / "medium",
 }
 
-GTFS_DIR = Path("../data/processed/gtfs_bus_only")
+GTFS_DIR = OUT_ROOT / "gtfs_bus_only"
 TRIPS_CSV = GTFS_DIR / "trips.txt"
 ROUTES_CSV = GTFS_DIR / "routes.txt"
 STOP_TIMES_CSV = GTFS_DIR / "stop_times.txt"
 STOPS_CSV = GTFS_DIR / "stops.txt"
 
-BLOCK_SUMMARY_PARQ = Path("../data/processed/block_success_summary_depot_only.parquet")
+BLOCK_SUMMARY_PARQ = OUT_ROOT / "block_success_summary_depot_only.parquet"
 
 # Plot sizes
 PLOT_WIDTH = 1600
