@@ -579,7 +579,7 @@ def _inject_card_css():
 
 # ---------------------- Main UI renderer ----------------------
 def render_block_panel():
-    st.markdown("## Energy Model – Block Level Summary Panel")
+    st.markdown("## Block Level Summary Panel")
 
     # Load metadata (40-ft only)
     block_inv = _load_block_summary()

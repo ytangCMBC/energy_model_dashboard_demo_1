@@ -1,14 +1,13 @@
 import json
 import ast
 import math
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
-
 
 from temp_3 import build_block_profile_with_charging 
 
@@ -22,6 +21,111 @@ BLOCK_SUMMARY_PATH = OUT_ROOT / "block_success_summary_depot_only.parquet"
 CANDIDATE_STOP_MAP_PATH = OUT_ROOT / "candidate_stop_map.parquet"
 
 SOC_THRESHOLD_PERCENT = 20.0
+
+
+# --------------------------------------------------------------------
+# Scenario helpers
+# --------------------------------------------------------------------
+def make_scenario_key(selected_candidates: List[str], matched_codes: Set[int]) -> str:
+    """Create a short, stable scenario key.
+
+    Why not just join candidate names?
+      - names can be long (session_state keys become unwieldy)
+      - you can change labels without changing the underlying stop codes
+      - the real driver of simulation output is the *set of stop codes*
+
+    We keep a human-readable prefix + a hash of the stop codes.
+    """
+    if not selected_candidates:
+        return "NONE"
+
+    # Hash the stop codes (order-independent)
+    codes_sorted = ",".join(map(str, sorted(matched_codes))).encode("utf-8")
+    codes_hash = hashlib.md5(codes_sorted).hexdigest()[:10]
+
+    if len(selected_candidates) <= 3:
+        prefix = "|".join(sorted(selected_candidates))
+    else:
+        prefix = f"{len(selected_candidates)}_locations"
+
+    return f"{prefix}__{codes_hash}"
+
+
+def compute_depot_summary(block_inv: pd.DataFrame) -> pd.DataFrame:
+    """Compute depot-level success summary from the *current* scenario dataframe."""
+    if block_inv.empty:
+        return pd.DataFrame()
+
+    tmp = block_inv.copy()
+    # Convert SUCCESS/FAILURE to 1/0 for fast groupby sums
+    tmp["med_dep_ok"] = (tmp["medium_success_depot_only"] == "SUCCESS").astype(int)
+    tmp["med_on_ok"] = (tmp["medium_success_on_route_charge"] == "SUCCESS").astype(int)
+    tmp["hev_dep_ok"] = (tmp["heavy_success_depot_only"] == "SUCCESS").astype(int)
+    tmp["hev_on_ok"] = (tmp["heavy_success_on_route_charge"] == "SUCCESS").astype(int)
+
+    g = tmp.groupby("depot_code", dropna=False)
+    summary = g.agg(
+        total_blocks=("block_id", "size"),
+        med_success_blocks_depot_only=("med_dep_ok", "sum"),
+        med_success_blocks_on_route=("med_on_ok", "sum"),
+        heavy_success_blocks_depot_only=("hev_dep_ok", "sum"),
+        heavy_success_blocks_on_route=("hev_on_ok", "sum"),
+    ).reset_index()
+
+    # Rates
+    summary["med_success_rate_depot_only_%"] = (
+        summary["med_success_blocks_depot_only"] / summary["total_blocks"] * 100.0
+    )
+    summary["med_success_rate_on_route_%"] = (
+        summary["med_success_blocks_on_route"] / summary["total_blocks"] * 100.0
+    )
+    summary["heavy_success_rate_depot_only_%"] = (
+        summary["heavy_success_blocks_depot_only"] / summary["total_blocks"] * 100.0
+    )
+    summary["heavy_success_rate_on_route_%"] = (
+        summary["heavy_success_blocks_on_route"] / summary["total_blocks"] * 100.0
+    )
+
+    # Friendly sorting
+    summary = summary.sort_values("depot_code", kind="stable")
+    return summary
+
+
+def compute_service_day_summary(block_inv: pd.DataFrame) -> pd.DataFrame:
+    """Compute service_day-level success summary from the *current* scenario dataframe."""
+    if block_inv.empty:
+        return pd.DataFrame()
+
+    tmp = block_inv.copy()
+    tmp["med_dep_ok"] = (tmp["medium_success_depot_only"] == "SUCCESS").astype(int)
+    tmp["med_on_ok"] = (tmp["medium_success_on_route_charge"] == "SUCCESS").astype(int)
+    tmp["hev_dep_ok"] = (tmp["heavy_success_depot_only"] == "SUCCESS").astype(int)
+    tmp["hev_on_ok"] = (tmp["heavy_success_on_route_charge"] == "SUCCESS").astype(int)
+
+    g = tmp.groupby("service_day", dropna=False)
+    summary = g.agg(
+        total_blocks=("block_id", "size"),
+        med_success_blocks_depot_only=("med_dep_ok", "sum"),
+        med_success_blocks_on_route=("med_on_ok", "sum"),
+        heavy_success_blocks_depot_only=("hev_dep_ok", "sum"),
+        heavy_success_blocks_on_route=("hev_on_ok", "sum"),
+    ).reset_index()
+
+    summary["med_success_rate_depot_only_%"] = (
+        summary["med_success_blocks_depot_only"] / summary["total_blocks"] * 100.0
+    )
+    summary["med_success_rate_on_route_%"] = (
+        summary["med_success_blocks_on_route"] / summary["total_blocks"] * 100.0
+    )
+    summary["heavy_success_rate_depot_only_%"] = (
+        summary["heavy_success_blocks_depot_only"] / summary["total_blocks"] * 100.0
+    )
+    summary["heavy_success_rate_on_route_%"] = (
+        summary["heavy_success_blocks_on_route"] / summary["total_blocks"] * 100.0
+    )
+
+    # Keep original ordering (service_day is often categorical)
+    return summary
 
 
 # --------------------------------------------------------------------
@@ -221,7 +325,7 @@ def make_block_soc_plot(
 # Main UI renderer (for multi-panel app)
 # --------------------------------------------------------------------
 def render_onroute_panel():
-    st.markdown("## Energy Model--On-Route Charge Summary Panel")
+    st.markdown("## On-Route Charge Summary Panel")
 
     # ---- Load base block summary & candidate stops ----
     blocks_base = load_block_summary(BLOCK_SUMMARY_PATH)
@@ -267,32 +371,40 @@ def render_onroute_panel():
         # Determine matched_codes for current scenario
         if not selected_candidates:
             matched_codes: Set[int] = set()
-            scenario_name = "NONE"
+            scenario_label = "NONE"
         else:
             matched_codes = set()
             for name in selected_candidates:
                 matched_codes |= candidate_dict.get(name, set())
-            scenario_name = (
+            scenario_label = (
                 "ALL"
                 if len(selected_candidates) == len(candidate_names)
                 else "|".join(sorted(selected_candidates))
             )
 
+        # IMPORTANT:
+        # Use a *stop-code-based* cache key so depot-level and SOC outputs always
+        # correspond to the exact active set of charger stop codes.
+        scenario_key = make_scenario_key(selected_candidates, matched_codes)
+
         st.markdown(
-            f"**Active scenario:** `{scenario_name}` "
+            f"**Active scenario:** `{scenario_label}` "
             f"({len(matched_codes)} charger stop codes)"
         )
+
+        with st.expander("Debug: scenario cache key", expanded=False):
+            st.code(scenario_key)
 
     # -------------------------------
     # 2. Run or reuse scenario simulation (auto on location change)
     # -------------------------------
     cache = st.session_state["onroute_scenario_cache"]
-    if scenario_name not in cache:
+    if scenario_key not in cache:
         with st.spinner("Running on-route simulation for all blocks..."):
             report_df = simulate_all_blocks_for_scenario(blocks_base, matched_codes)
-        cache[scenario_name] = report_df
+        cache[scenario_key] = report_df
     else:
-        report_df = cache[scenario_name]
+        report_df = cache[scenario_key]
 
     block_inv = report_df  # alias to mirror beb_dashboard pattern
 
@@ -465,212 +577,179 @@ def render_onroute_panel():
     # -------------------------------
     # Depot-level summary (all blocks in this scenario, by depot)
     # -------------------------------
-    st.markdown("### Success Rate Breakdown (Depot & Service Day)")
+    st.markdown("### Depot-level summary (depot-only vs on-route)")
 
-    depot_rows = []
-    for depot_code, g in block_inv.groupby("depot_code"):
-        # Medium masks
-        med_dep_mask = g["medium_success_depot_only"] == "SUCCESS"
-        med_on_mask  = g["medium_success_on_route_charge"] == "SUCCESS"
+    # IMPORTANT:
+    # Always compute depot summary from *block_inv* (the scenario-specific report_df).
+    # Do NOT store this in session_state without the scenario_key, or it can become stale.
+    depot_summary_df = compute_depot_summary(block_inv)
+    st.dataframe(depot_summary_df, width="stretch")
 
-        # Heavy masks
-        hev_dep_mask = g["heavy_success_depot_only"] == "SUCCESS"
-        hev_on_mask  = g["heavy_success_on_route_charge"] == "SUCCESS"
+    # Optional: quick visual sanity check (helps confirm it updates when you toggle chargers)
 
-        total_blocks = len(g)
+    st.markdown("#### Success rate comparison charts")
 
-        med_dep_n = int(med_dep_mask.sum())
-        med_on_n  = int(med_on_mask.sum())
-        hev_dep_n = int(hev_dep_mask.sum())
-        hev_on_n  = int(hev_on_mask.sum())
-
-        med_dep_rate = med_dep_n / total_blocks * 100.0 if total_blocks > 0 else float("nan")
-        med_on_rate  = med_on_n  / total_blocks * 100.0 if total_blocks > 0 else float("nan")
-        hev_dep_rate = hev_dep_n / total_blocks * 100.0 if total_blocks > 0 else float("nan")
-        hev_on_rate  = hev_on_n  / total_blocks * 100.0 if total_blocks > 0 else float("nan")
-
-        depot_rows.append(
-            {
-                "depot_code": depot_code,
-                "total_blocks": total_blocks,
-
-                # Medium
-                "med_success_blocks_depot_only": med_dep_n,
-                "med_success_rate_depot_only_%": med_dep_rate,
-                "med_success_blocks_on_route": med_on_n,
-                "med_success_rate_on_route_%": med_on_rate,
-
-                # Heavy
-                "heavy_success_blocks_depot_only": hev_dep_n,
-                "heavy_success_rate_depot_only_%": hev_dep_rate,
-                "heavy_success_blocks_on_route": hev_on_n,
-                "heavy_success_rate_on_route_%": hev_on_rate,
-            }
-        )
-
-    depot_summary_df = pd.DataFrame(depot_rows).sort_values("depot_code")
+    # Optional: if you later add 'service_id', it will auto-switch; otherwise it uses service_day
+    service_group_col = "service_id" if "service_id" in block_inv.columns else "service_day"
+    service_group_label = "Service ID" if service_group_col == "service_id" else "Service day"
 
     # -------------------------------
-    # Service-day summary (all blocks in this scenario, by service_day)
+    # Row 1: Group by depot_code
+    #   Col 1 = Heavy duty, Col 2 = Medium duty
     # -------------------------------
-    service_day_rows = []
-    for svc_day, g in block_inv.groupby("service_day"):
-        # Medium masks
-        med_dep_mask = g["medium_success_depot_only"] == "SUCCESS"
-        med_on_mask  = g["medium_success_on_route_charge"] == "SUCCESS"
-
-        # Heavy masks
-        hev_dep_mask = g["heavy_success_depot_only"] == "SUCCESS"
-        hev_on_mask  = g["heavy_success_on_route_charge"] == "SUCCESS"
-
-        total_blocks = len(g)
-
-        med_dep_n = int(med_dep_mask.sum())
-        med_on_n  = int(med_on_mask.sum())
-        hev_dep_n = int(hev_dep_mask.sum())
-        hev_on_n  = int(hev_on_mask.sum())
-
-        med_dep_rate = med_dep_n / total_blocks * 100.0 if total_blocks > 0 else float("nan")
-        med_on_rate  = med_on_n  / total_blocks * 100.0 if total_blocks > 0 else float("nan")
-        hev_dep_rate = hev_dep_n / total_blocks * 100.0 if total_blocks > 0 else float("nan")
-        hev_on_rate  = hev_on_n  / total_blocks * 100.0 if total_blocks > 0 else float("nan")
-
-        service_day_rows.append(
-            {
-                "service_day": svc_day,
-                "total_blocks": total_blocks,
-
-                # Medium
-                "med_success_blocks_depot_only": med_dep_n,
-                "med_success_rate_depot_only_%": med_dep_rate,
-                "med_success_blocks_on_route": med_on_n,
-                "med_success_rate_on_route_%": med_on_rate,
-
-                # Heavy
-                "heavy_success_blocks_depot_only": hev_dep_n,
-                "heavy_success_rate_depot_only_%": hev_dep_rate,
-                "heavy_success_blocks_on_route": hev_on_n,
-                "heavy_success_rate_on_route_%": hev_on_rate,
-            }
+    if not depot_summary_df.empty:
+        depot_long = depot_summary_df.melt(
+            id_vars=["depot_code"],
+            value_vars=[
+                "med_success_rate_depot_only_%",
+                "med_success_rate_on_route_%",
+                "heavy_success_rate_depot_only_%",
+                "heavy_success_rate_on_route_%",
+            ],
+            var_name="metric",
+            value_name="success_rate",
         )
+        depot_long["duty"] = depot_long["metric"].apply(lambda s: "Medium" if s.startswith("med_") else "Heavy")
+        depot_long["scenario"] = depot_long["metric"].apply(lambda s: "Depot-only" if "depot_only" in s else "On-route")
+        depot_long["depot_code"] = depot_long["depot_code"].astype(str)
 
-    service_day_summary_df = pd.DataFrame(service_day_rows)
+        r1c1, r1c2 = st.columns(2)
 
+        with r1c1:
+            heavy_depot = depot_long[depot_long["duty"] == "Heavy"].copy()
+            fig = px.bar(
+                heavy_depot,
+                x="depot_code",
+                y="success_rate",
+                color="scenario",
+                barmode="group",
+                title="Success rate by depot (Heavy duty)",
+                labels={"depot_code": "Depot", "success_rate": "Success rate (%)"},
+                text="success_rate",
+            )
+            fig.update_traces(
+                texttemplate="%{text:.1f}%",
+                textposition="outside"
+            )
+            fig.update_yaxes(range=[0, 100])
+            st.plotly_chart(fig, use_container_width=True)
 
-    def plot_group_success_bars_plotly(df, x_col, title, depot_col, onroute_col, xaxis_title):
-        d = df.copy()
+        with r1c2:
+            med_depot = depot_long[depot_long["duty"] == "Medium"].copy()
+            fig = px.bar(
+                med_depot,
+                x="depot_code",
+                y="success_rate",
+                color="scenario",
+                barmode="group",
+                title="Success rate by depot (Medium duty)",
+                labels={"depot_code": "Depot", "success_rate": "Success rate (%)"},
+                text="success_rate",
+            )
+            fig.update_traces(
+                texttemplate="%{text:.1f}%",
+                textposition="outside"
+            )
+            fig.update_yaxes(range=[0, 100])
+            st.plotly_chart(fig, use_container_width=True)
 
-        # Sort nicely
-        if x_col == "service_day":
-            d["_k"] = pd.to_numeric(d[x_col], errors="coerce")
-            if d["_k"].notna().all():
-                d = d.sort_values("_k")
-            else:
-                d = d.sort_values(x_col)
-            d = d.drop(columns=["_k"], errors="ignore")
-        else:
-            d = d.sort_values(x_col)
+    # -------------------------------
+    # Row 2: Group by service_id / service_day
+    #   Col 1 = Heavy duty, Col 2 = Medium duty
+    # -------------------------------
+    # If your compute_service_day_summary always groups by service_day, this still works.
+    svc_summary_df = compute_service_day_summary(block_inv)
 
-        # Convert to numeric just in case
-        d[depot_col] = pd.to_numeric(d[depot_col], errors="coerce")
-        d[onroute_col] = pd.to_numeric(d[onroute_col], errors="coerce")
+    if not svc_summary_df.empty:
+        # If you later implement compute_service_id_summary, you can swap it in here.
+        # For now, this stays service_day-based (your current function does groupby("service_day")).
 
-        fig = go.Figure()
-
-        fig.add_bar(
-            x=d[x_col].astype(str),
-            y=d[depot_col],
-            name="Depot-only Charging",
-            text=d[depot_col].map(lambda v: f"{v:.1f}%" if pd.notna(v) else ""),
-            textposition="outside",
+        id_col = "service_day"  # current output column name from compute_service_day_summary()
+        svc_long = svc_summary_df.melt(
+            id_vars=[id_col],
+            value_vars=[
+                "med_success_rate_depot_only_%",
+                "med_success_rate_on_route_%",
+                "heavy_success_rate_depot_only_%",
+                "heavy_success_rate_on_route_%",
+            ],
+            var_name="metric",
+            value_name="success_rate",
         )
+        svc_long["duty"] = svc_long["metric"].apply(lambda s: "Medium" if s.startswith("med_") else "Heavy")
+        svc_long["scenario"] = svc_long["metric"].apply(lambda s: "Depot-only" if "depot_only" in s else "On-route")
+        svc_long[id_col] = svc_long[id_col].astype(str)
 
-        fig.add_bar(
-            x=d[x_col].astype(str),
-            y=d[onroute_col],
-            name="On-route Charging",
-            text=d[onroute_col].map(lambda v: f"{v:.1f}%" if pd.notna(v) else ""),
-            textposition="outside",
-        )
+        r2c1, r2c2 = st.columns(2)
 
-        fig.update_layout(
-            title=title,
-            barmode="group",
-            yaxis_title="Success Rate (%)",
-            xaxis_title=xaxis_title,
-            yaxis=dict(range=[0, 105]),
-            template="plotly_white",
-            height=480,
-            margin=dict(l=40, r=20, t=60, b=40),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-
-
-    tab1, tab2 = st.tabs(["Medium-duty", "Heavy-duty"])
-
-    with tab1:
-        col1, col2 = st.columns(2)
-
-        with col1:
-            plot_group_success_bars_plotly(
-                depot_summary_df,
-                x_col="depot_code",
-                title="Medium-duty — by Depot",
-                depot_col="med_success_rate_depot_only_%",
-                onroute_col="med_success_rate_on_route_%",
-                xaxis_title="Depot",
+        with r2c1:
+            heavy_svc = svc_long[svc_long["duty"] == "Heavy"].copy()
+            fig = px.bar(
+                heavy_svc,
+                x=id_col,
+                y="success_rate",
+                color="scenario",
+                barmode="group",
+                title=f"Success rate by {service_group_label} (Heavy duty)",
+                labels={id_col: service_group_label, "success_rate": "Success rate (%)"},
+                text="success_rate",
             )
-
-        with col2:
-            plot_group_success_bars_plotly(
-                service_day_summary_df,
-                x_col="service_day",
-                title="Medium-duty — by Service Day",
-                depot_col="med_success_rate_depot_only_%",
-                onroute_col="med_success_rate_on_route_%",
-                xaxis_title="Service Day",
+            fig.update_traces(
+                texttemplate="%{text:.1f}%",
+                textposition="outside"
             )
+            fig.update_yaxes(range=[0, 100])
+            st.plotly_chart(fig, use_container_width=True)
 
-    with tab2:
-        col1, col2 = st.columns(2)
-
-        with col1:
-            plot_group_success_bars_plotly(
-                depot_summary_df,
-                x_col="depot_code",
-                title="Heavy-duty — by Depot",
-                depot_col="heavy_success_rate_depot_only_%",
-                onroute_col="heavy_success_rate_on_route_%",
-                xaxis_title="Depot",
+        with r2c2:
+            med_svc = svc_long[svc_long["duty"] == "Medium"].copy()
+            fig = px.bar(
+                med_svc,
+                x=id_col,
+                y="success_rate",
+                color="scenario",
+                barmode="group",
+                title=f"Success rate by {service_group_label} (Medium duty)",
+                labels={id_col: service_group_label, "success_rate": "Success rate (%)"},
+                text="success_rate",
             )
-
-        with col2:
-            plot_group_success_bars_plotly(
-                service_day_summary_df,
-                x_col="service_day",
-                title="Heavy-duty — by Service Day",
-                depot_col="heavy_success_rate_depot_only_%",
-                onroute_col="heavy_success_rate_on_route_%",
-                xaxis_title="Service Day",
+            fig.update_traces(
+                texttemplate="%{text:.1f}%",
+                textposition="outside"
             )
+            fig.update_yaxes(range=[0, 100])
+            st.plotly_chart(fig, use_container_width=True)
 
-
-
-    # st.dataframe(depot_summary_df, width="stretch")
 
     st.markdown("---")
 
     # 4.1 SOC vs distance plot for selected block
+    plot_mode = energy_mode_key
+
+    st.markdown("#### Selected block: on-route charging stats")
+    if plot_mode == "heavy":
+        soc_min_col = "soc_min_heavy_on_route"
+        soc_end_col = "soc_left_heavy_percent_on_route_charge"
+        recv_col = "total_energy_received_heavy"
+        succ_col = "heavy_success_on_route_charge"
+    else:
+        soc_min_col = "soc_min_medium_on_route"
+        soc_end_col = "soc_left_medium_percent_on_route_charge"
+        recv_col = "total_energy_received_medium"
+        succ_col = "medium_success_on_route_charge"
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("On-route energy received (kWh)", f"{float(row_block.get(recv_col, float('nan'))):.2f}")
+    k2.metric("On-route SOC min (%)", f"{float(row_block.get(soc_min_col, float('nan'))):.2f}")
+    k3.metric("On-route SOC end (%)", f"{float(row_block.get(soc_end_col, float('nan'))):.2f}")
+    k4.metric("On-route result", str(row_block.get(succ_col, "")))
+
     st.subheader(
         f"SOC profile for Depot-only vs On-route charging "
         f"(Depot {row_block['depot_code']}, Day {service_day}, LG {line_group}, Block {block_number})"
     )
 
     block_trips = row_block["block_trips"]
-    plot_mode = energy_mode_key 
 
     fig = make_block_soc_plot(
         block_trips=block_trips,

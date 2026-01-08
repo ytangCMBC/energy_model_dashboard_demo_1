@@ -157,7 +157,7 @@ def load_mandatory(path_dir: Path, shape_id: str):
 # Streamlit Panel Renderer
 # ---------------------------
 def render_trip_panel():
-    st.markdown("## Energy Model--Route Level Summary Panel")
+    st.markdown("## Route Level Summary Panel")
 
     # Trip type selector
     with st.sidebar:
