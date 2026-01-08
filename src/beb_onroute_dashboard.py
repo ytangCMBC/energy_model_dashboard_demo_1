@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Set, Tuple
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
+
 
 from temp_3 import build_block_profile_with_charging 
 
@@ -463,7 +465,7 @@ def render_onroute_panel():
     # -------------------------------
     # Depot-level summary (all blocks in this scenario, by depot)
     # -------------------------------
-    st.markdown("### Depot-level summary (depot-only vs on-route)")
+    st.markdown("### Success Rate Breakdown (Depot & Service Day)")
 
     depot_rows = []
     for depot_code, g in block_inv.groupby("depot_code"):
@@ -508,7 +510,156 @@ def render_onroute_panel():
 
     depot_summary_df = pd.DataFrame(depot_rows).sort_values("depot_code")
 
-    st.dataframe(depot_summary_df, width="stretch")
+    # -------------------------------
+    # Service-day summary (all blocks in this scenario, by service_day)
+    # -------------------------------
+    service_day_rows = []
+    for svc_day, g in block_inv.groupby("service_day"):
+        # Medium masks
+        med_dep_mask = g["medium_success_depot_only"] == "SUCCESS"
+        med_on_mask  = g["medium_success_on_route_charge"] == "SUCCESS"
+
+        # Heavy masks
+        hev_dep_mask = g["heavy_success_depot_only"] == "SUCCESS"
+        hev_on_mask  = g["heavy_success_on_route_charge"] == "SUCCESS"
+
+        total_blocks = len(g)
+
+        med_dep_n = int(med_dep_mask.sum())
+        med_on_n  = int(med_on_mask.sum())
+        hev_dep_n = int(hev_dep_mask.sum())
+        hev_on_n  = int(hev_on_mask.sum())
+
+        med_dep_rate = med_dep_n / total_blocks * 100.0 if total_blocks > 0 else float("nan")
+        med_on_rate  = med_on_n  / total_blocks * 100.0 if total_blocks > 0 else float("nan")
+        hev_dep_rate = hev_dep_n / total_blocks * 100.0 if total_blocks > 0 else float("nan")
+        hev_on_rate  = hev_on_n  / total_blocks * 100.0 if total_blocks > 0 else float("nan")
+
+        service_day_rows.append(
+            {
+                "service_day": svc_day,
+                "total_blocks": total_blocks,
+
+                # Medium
+                "med_success_blocks_depot_only": med_dep_n,
+                "med_success_rate_depot_only_%": med_dep_rate,
+                "med_success_blocks_on_route": med_on_n,
+                "med_success_rate_on_route_%": med_on_rate,
+
+                # Heavy
+                "heavy_success_blocks_depot_only": hev_dep_n,
+                "heavy_success_rate_depot_only_%": hev_dep_rate,
+                "heavy_success_blocks_on_route": hev_on_n,
+                "heavy_success_rate_on_route_%": hev_on_rate,
+            }
+        )
+
+    service_day_summary_df = pd.DataFrame(service_day_rows)
+
+
+    def plot_group_success_bars_plotly(df, x_col, title, depot_col, onroute_col, xaxis_title):
+        d = df.copy()
+
+        # Sort nicely
+        if x_col == "service_day":
+            d["_k"] = pd.to_numeric(d[x_col], errors="coerce")
+            if d["_k"].notna().all():
+                d = d.sort_values("_k")
+            else:
+                d = d.sort_values(x_col)
+            d = d.drop(columns=["_k"], errors="ignore")
+        else:
+            d = d.sort_values(x_col)
+
+        # Convert to numeric just in case
+        d[depot_col] = pd.to_numeric(d[depot_col], errors="coerce")
+        d[onroute_col] = pd.to_numeric(d[onroute_col], errors="coerce")
+
+        fig = go.Figure()
+
+        fig.add_bar(
+            x=d[x_col].astype(str),
+            y=d[depot_col],
+            name="Depot-only Charging",
+            text=d[depot_col].map(lambda v: f"{v:.1f}%" if pd.notna(v) else ""),
+            textposition="outside",
+        )
+
+        fig.add_bar(
+            x=d[x_col].astype(str),
+            y=d[onroute_col],
+            name="On-route Charging",
+            text=d[onroute_col].map(lambda v: f"{v:.1f}%" if pd.notna(v) else ""),
+            textposition="outside",
+        )
+
+        fig.update_layout(
+            title=title,
+            barmode="group",
+            yaxis_title="Success Rate (%)",
+            xaxis_title=xaxis_title,
+            yaxis=dict(range=[0, 105]),
+            template="plotly_white",
+            height=480,
+            margin=dict(l=40, r=20, t=60, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+
+
+    tab1, tab2 = st.tabs(["Medium-duty", "Heavy-duty"])
+
+    with tab1:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            plot_group_success_bars_plotly(
+                depot_summary_df,
+                x_col="depot_code",
+                title="Medium-duty — by Depot",
+                depot_col="med_success_rate_depot_only_%",
+                onroute_col="med_success_rate_on_route_%",
+                xaxis_title="Depot",
+            )
+
+        with col2:
+            plot_group_success_bars_plotly(
+                service_day_summary_df,
+                x_col="service_day",
+                title="Medium-duty — by Service Day",
+                depot_col="med_success_rate_depot_only_%",
+                onroute_col="med_success_rate_on_route_%",
+                xaxis_title="Service Day",
+            )
+
+    with tab2:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            plot_group_success_bars_plotly(
+                depot_summary_df,
+                x_col="depot_code",
+                title="Heavy-duty — by Depot",
+                depot_col="heavy_success_rate_depot_only_%",
+                onroute_col="heavy_success_rate_on_route_%",
+                xaxis_title="Depot",
+            )
+
+        with col2:
+            plot_group_success_bars_plotly(
+                service_day_summary_df,
+                x_col="service_day",
+                title="Heavy-duty — by Service Day",
+                depot_col="heavy_success_rate_depot_only_%",
+                onroute_col="heavy_success_rate_on_route_%",
+                xaxis_title="Service Day",
+            )
+
+
+
+    # st.dataframe(depot_summary_df, width="stretch")
 
     st.markdown("---")
 
