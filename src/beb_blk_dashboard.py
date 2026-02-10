@@ -425,7 +425,7 @@ def _bus_icon():
 
 
 # ---------------------- Energy helpers ----------------------
-BATTERY_USABLE_KWH = 376.0      # usable pack energy
+BATTERY_USABLE_KWH = 564.0      # usable pack energy
 START_SOC = 0.90                # 90% start
 INIT_KWH = BATTERY_USABLE_KWH * START_SOC
 

@@ -358,12 +358,27 @@ def render_onroute_panel():
                 "Uncheck the ones you want to remove."
             )
 
+            # ---- Quick actions ----
+            # These buttons update the checkbox states stored in st.session_state.
+            cand_keys = [f"cand_{n}" for n in candidate_names]
+            b1, b2 = st.columns(2)
+            if b1.button("Select all", use_container_width=True, key="cand_select_all"):
+                for k in cand_keys:
+                    st.session_state[k] = True
+                st.rerun()
+
+            if b2.button("Clear all", use_container_width=True, key="cand_clear_all"):
+                for k in cand_keys:
+                    st.session_state[k] = False
+                st.rerun()
+
             selected_candidates: List[str] = []
             for name in candidate_names:
+                k = f"cand_{name}"
                 checked = st.checkbox(
                     label=name,
-                    value=True,
-                    key=f"cand_{name}",
+                    value=st.session_state.get(k, True),
+                    key=k,
                 )
                 if checked:
                     selected_candidates.append(name)
@@ -520,7 +535,7 @@ def render_onroute_panel():
 
     st.subheader("KPI: depot-only vs on-route (all blocks)")
 
-    # Masks
+    # Masks (SUCCESS = SOC_min >= threshold)
     med_depot_mask = block_inv["medium_success_depot_only"] == "SUCCESS"
     med_on_mask    = block_inv["medium_success_on_route_charge"] == "SUCCESS"
     hev_depot_mask = block_inv["heavy_success_depot_only"] == "SUCCESS"
@@ -538,46 +553,49 @@ def render_onroute_panel():
     hev_depot_n = int(hev_depot_mask.sum())
     hev_on_n    = int(hev_on_mask.sum())
 
-    # --- Row 1: success RATES ---
+    # Distance KPI (sum of total_distance_km over SUCCESS blocks)
+    dist_col = "total_distance_km"
+    if dist_col in block_inv.columns:
+        dist_series = pd.to_numeric(block_inv[dist_col], errors="coerce").fillna(0.0)
+        med_depot_km = float(dist_series[med_depot_mask].sum())
+        med_on_km    = float(dist_series[med_on_mask].sum())
+        hev_depot_km = float(dist_series[hev_depot_mask].sum())
+        hev_on_km    = float(dist_series[hev_on_mask].sum())
+    else:
+        med_depot_km = med_on_km = hev_depot_km = hev_on_km = float("nan")
+
+    def _km_delta_str(on_km: float, dep_km: float) -> str:
+        if not (pd.notna(on_km) and pd.notna(dep_km)):
+            return ""
+        delta = on_km - dep_km
+        if dep_km > 0:
+            pct = delta / dep_km * 100.0
+            return f"{delta:+.1f} km ({pct:+.1f}%)"
+        return f"{delta:+.1f} km"
+
+    # --- Row 1: successful block COUNTS ---
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Medium depot-only success (%)", f"{med_depot_rate:.2f}")
-    c2.metric(
-        "Medium on-route success (%)",
-        f"{med_on_rate:.2f}",
-        delta=f"{(med_on_rate - med_depot_rate):+.2f} pts",
-    )
-    c3.metric("Heavy depot-only success (%)", f"{hev_depot_rate:.2f}")
-    c4.metric(
-        "Heavy on-route success (%)",
-        f"{hev_on_rate:.2f}",
-        delta=f"{(hev_on_rate - hev_depot_rate):+.2f} pts",
-    )
+    c1.metric("Medium successful blocks (depot-only)", f"{med_depot_n}")
+    c2.metric("Medium successful blocks (on-route)", f"{med_on_n}", delta=f"{med_on_n - med_depot_n:+d}")
+    c3.metric("Heavy successful blocks (depot-only)", f"{hev_depot_n}")
+    c4.metric("Heavy successful blocks (on-route)", f"{hev_on_n}", delta=f"{hev_on_n - hev_depot_n:+d}")
 
-    # --- Row 2: success COUNTS ---
+    # --- Row 2: success PERCENTAGES ---
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric(
-        "Medium successful blocks (depot-only)",
-        f"{med_depot_n}",
-    )
-    c6.metric(
-        "Medium successful blocks (on-route)",
-        f"{med_on_n}",
-        delta=f"{med_on_n - med_depot_n:+d}",
-    )
-    c7.metric(
-        "Heavy successful blocks (depot-only)",
-        f"{hev_depot_n}",
-    )
-    c8.metric(
-        "Heavy successful blocks (on-route)",
-        f"{hev_on_n}",
-        delta=f"{hev_on_n - hev_depot_n:+d}",
-    )
+    c5.metric("Medium success (%) (depot-only)", f"{med_depot_rate:.2f}")
+    c6.metric("Medium success (%) (on-route)", f"{med_on_rate:.2f}", delta=f"{(med_on_rate - med_depot_rate):+.2f} pts")
+    c7.metric("Heavy success (%) (depot-only)", f"{hev_depot_rate:.2f}")
+    c8.metric("Heavy success (%) (on-route)", f"{hev_on_rate:.2f}", delta=f"{(hev_on_rate - hev_depot_rate):+.2f} pts")
 
-    # -------------------------------
-    # Depot-level summary (all blocks in this scenario, by depot)
-    # -------------------------------
+    # --- Row 3: Serviceable distance (km) over successful blocks ---
+    c9, c10, c11, c12 = st.columns(4)
+    c9.metric("Medium service distance (km) (depot-only)", f"{med_depot_km:,.1f}")
+    c10.metric("Medium service distance (km) (on-route)", f"{med_on_km:,.1f}", delta=_km_delta_str(med_on_km, med_depot_km))
+    c11.metric("Heavy service distance (km) (depot-only)", f"{hev_depot_km:,.1f}")
+    c12.metric("Heavy service distance (km) (on-route)", f"{hev_on_km:,.1f}", delta=_km_delta_str(hev_on_km, hev_depot_km))
+
     st.markdown("### Depot-level summary (depot-only vs on-route)")
+
 
     # IMPORTANT:
     # Always compute depot summary from *block_inv* (the scenario-specific report_df).

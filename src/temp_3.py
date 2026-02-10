@@ -78,9 +78,10 @@ def _infer_trip_distance_km(trip):
     return 1.0
 
 
-BATTERY_KWH = 376.0
+
+BATTERY_KWH = 564.0
 MAX_SOC_FRAC = 0.90
-MAX_ENERGY_KWH = BATTERY_KWH * MAX_SOC_FRAC 
+MAX_ENERGY_KWH = BATTERY_KWH * MAX_SOC_FRAC  
 INTERLINE_TYPES = {"interline"}
 
 def build_block_profile_with_charging(block_trips,
@@ -176,7 +177,7 @@ def build_block_profile_with_charging(block_trips,
                 if has_start or has_end:
                     # 1) start-only: charge at BEGINNING of interline
                     if has_start and not has_end:
-                        duration_sec = 6 * 60
+                        duration_sec = 5 * 60
                         delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
 
                         kwh_before = kwh
@@ -203,7 +204,7 @@ def build_block_profile_with_charging(block_trips,
 
                     # 3) end-only OR both: charge at END of interline
                     if has_end:
-                        duration_sec = 6 * 60
+                        duration_sec = 5 * 60
                         delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
 
                         kwh_before = kwh
@@ -241,7 +242,7 @@ def build_block_profile_with_charging(block_trips,
                 _code_in_matched(next_start_code, matched_codes)
             )
             if eligible:
-                duration_sec = 6 * 60  # fixed 6 min
+                duration_sec = 5 * 60  # fixed 5 min
                 if duration_sec > 0:
                     delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
 
@@ -280,7 +281,7 @@ def build_block_profile_with_charging(block_trips,
                 )
 
                 if eligible:
-                    duration_sec = max(0, layover - 60)  # minus 1 min prep
+                    duration_sec = max(0, layover - 120)  # minus 2 min prep
                     if duration_sec > 0:
                         delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
 
@@ -307,5 +308,6 @@ def build_block_profile_with_charging(block_trips,
         "cum_charged_kwh": charged_hist,
     })
     return profile
+
 
 
