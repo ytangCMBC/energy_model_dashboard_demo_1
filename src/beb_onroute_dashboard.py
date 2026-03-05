@@ -279,32 +279,151 @@ def simulate_all_blocks_for_scenario(
 # --------------------------------------------------------------------
 # Plot helper: SOC vs Distance (Depot-only vs On-route)
 # --------------------------------------------------------------------
+
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def extract_charging_events(
+    profile_on: pd.DataFrame,
+    stop_code_to_candidate: Dict[int, str] | None = None,
+) -> pd.DataFrame:
+    """
+    Build charging-session events from the per-step on-route profile.
+
+    Requirements:
+      - profile has 'dist_km', 'soc_pct', and 'cum_charged_kwh'
+    Optional:
+      - candidate name columns (candidate_name / charger_name / location / etc.)
+      - stop code columns (stop_code / charger_stop_code / ...)
+      - time column (time_s). If missing, we will approximate using index as seconds.
+    """
+    print(profile_on.head())
+    if profile_on is None or profile_on.empty:
+        return pd.DataFrame()
+
+    required = {"dist_km", "soc_pct", "cum_charged_kwh"}
+    if not required.issubset(profile_on.columns):
+        return pd.DataFrame()
+
+    df = profile_on.copy()
+
+    # ---- Time (seconds) ----
+    time_col = _pick_col(df, ["time_s", "t_s", "sec", "seconds"])
+    if time_col is None:
+        # Fallback: assume 1-second step if not provided
+        df["_time_s"] = df.index.astype(float)
+        time_col = "_time_s"
+
+    # ---- Charging delta per step ----
+    df["_dcharged_kwh"] = pd.to_numeric(df["cum_charged_kwh"], errors="coerce").fillna(0.0).diff().fillna(0.0)
+    df["_is_charging"] = df["_dcharged_kwh"] > 1e-9
+
+    if not df["_is_charging"].any():
+        return pd.DataFrame()
+
+    # ---- Candidate name discovery ----
+    cand_name_col = _pick_col(df, ["candidate_name", "charger_name", "location_name", "candidate", "location"])
+    stop_code_col = _pick_col(df, ["stop_code", "charger_stop_code", "charge_stop_code"])
+
+    # ---- Identify contiguous charging spans ----
+    # event_id increments when charging starts
+    df["_event_id"] = (df["_is_charging"] & ~df["_is_charging"].shift(fill_value=False)).cumsum()
+    charging = df[df["_is_charging"]].copy()
+
+    events = []
+    for eid, g in charging.groupby("_event_id"):
+        g = g.sort_values(time_col, kind="stable")
+
+        t0 = float(g[time_col].iloc[0])
+        t1 = float(g[time_col].iloc[-1])
+        duration_min = max(0.0, (t1 - t0) / 60.0)
+
+        energy_kwh = float(g["_dcharged_kwh"].sum())
+
+        # choose a representative point for plotting (midpoint of session)
+        mid_idx = g.index[len(g) // 2]
+        x_km = float(df.loc[mid_idx, "dist_km"])
+        y_soc = float(df.loc[mid_idx, "soc_pct"])
+
+        # candidate name resolution
+        cand_name = None
+        if cand_name_col is not None:
+            # most frequent non-null name in the session
+            s = g[cand_name_col].dropna().astype(str)
+            if not s.empty:
+                cand_name = s.value_counts().index[0]
+
+        if cand_name is None and stop_code_col is not None and stop_code_to_candidate:
+            s = g[stop_code_col].dropna()
+            if not s.empty:
+                try:
+                    code = int(str(s.iloc[0]).strip())
+                    cand_name = stop_code_to_candidate.get(code)
+                except Exception:
+                    pass
+
+        if cand_name is None:
+            cand_name = "Unknown location"
+
+        # also keep start/end distance if you want later
+        d0 = float(g["dist_km"].min())
+        d1 = float(g["dist_km"].max())
+
+        events.append(
+            {
+                "event_id": int(eid),
+                "candidate_name": cand_name,
+                "duration_min": duration_min,
+                "energy_kwh": energy_kwh,
+                "x_km": x_km,
+                "y_soc": y_soc,
+                "dist_start_km": d0,
+                "dist_end_km": d1,
+                "t_start_s": t0,
+                "t_end_s": t1,
+            }
+        )
+
+    return pd.DataFrame(events)
+
+
 def make_block_soc_plot(
     block_trips: List[Dict[str, Any]],
     matched_codes_onroute: Set[int],
     mode: str = "heavy",
-) -> px.line:
+    candidate_df: pd.DataFrame | None = None,
+):
     """
-    Build a SOC vs distance plot for a single block, comparing:
-    - depot-only (no chargers along route)
-    - on-route charging scenario
+    SOC vs distance plot (Depot-only vs On-route charging) + charging markers.
+
+    Returns:
+      fig, events_df
+
+    events_df columns (if any):
+      - candidate_name
+      - duration_min
+      - energy_kwh
+      - x_km
+      - y_soc
     """
-    # Depot-only approximation: no on-route chargers
+    # Depot-only
     profile_depot = build_block_profile_with_charging(
         block_trips,
         matched_codes=set(),
         mode=mode,
-    )
-    profile_depot = profile_depot.copy()
+    ).copy()
     profile_depot["scenario"] = "Depot-only"
 
-    # On-route scenario
+    # On-route
     profile_on = build_block_profile_with_charging(
         block_trips,
         matched_codes=matched_codes_onroute,
         mode=mode,
-    )
-    profile_on = profile_on.copy()
+    ).copy()
     profile_on["scenario"] = "On-route charging"
 
     combo = pd.concat([profile_depot, profile_on], ignore_index=True)
@@ -318,7 +437,58 @@ def make_block_soc_plot(
         labels={"dist_km": "Distance (km)", "soc_pct": "SOC (%)"},
     )
     fig.update_layout(legend_title_text="Scenario")
-    return fig
+
+    # --------------------------
+    # Build events_df from on-route profile
+    # --------------------------
+    events_df = pd.DataFrame()
+
+    # We rely on temp_3.py patch to add these columns on charge points:
+    #   stop_code, charge_kwh, charge_duration_sec
+    # (your current temp_3.py doesn't include them yet) :contentReference[oaicite:3]{index=3}
+    needed_cols = {"phase", "dist_km", "soc_pct", "charge_kwh", "charge_duration_sec", "stop_code"}
+    if needed_cols.issubset(set(profile_on.columns)):
+        pts = profile_on[profile_on["phase"] == "charge"].copy()
+
+        if not pts.empty:
+            # Map stop_code -> candidate_name
+            stop_to_name = {}
+            if candidate_df is not None and not candidate_df.empty:
+                if {"stop_code", "candidate_name"}.issubset(candidate_df.columns):
+                    tmp = candidate_df[["stop_code", "candidate_name"]].dropna().copy()
+                    tmp["stop_code"] = tmp["stop_code"].astype(str).str.strip()
+                    tmp["candidate_name"] = tmp["candidate_name"].astype(str).str.strip()
+                    stop_to_name = dict(zip(tmp["stop_code"], tmp["candidate_name"]))
+
+            pts["stop_code"] = pts["stop_code"].astype(str).str.strip()
+            pts["candidate_name"] = pts["stop_code"].map(stop_to_name).fillna("Unknown location")
+
+            pts["duration_min"] = pd.to_numeric(pts["charge_duration_sec"], errors="coerce").fillna(0.0) / 60.0
+            pts["energy_kwh"] = pd.to_numeric(pts["charge_kwh"], errors="coerce").fillna(0.0)
+            pts["x_km"] = pd.to_numeric(pts["dist_km"], errors="coerce").fillna(0.0)
+            pts["y_soc"] = pd.to_numeric(pts["soc_pct"], errors="coerce").fillna(0.0)
+
+            # what we return to UI
+            events_df = pts[["candidate_name", "duration_min", "energy_kwh", "x_km", "y_soc"]].reset_index(drop=True)
+
+            # Add markers
+            fig.add_scatter(
+                x=events_df["x_km"],
+                y=events_df["y_soc"],
+                mode="markers",
+                name="Charging event",
+                customdata=events_df[["candidate_name", "duration_min", "energy_kwh"]].values,
+                hovertemplate=(
+                    "<b>Charging event</b><br>"
+                    "Location: %{customdata[0]}<br>"
+                    "Duration: %{customdata[1]:.1f} min<br>"
+                    "Energy: %{customdata[2]:.2f} kWh<br>"
+                    "Distance: %{x:.2f} km<br>"
+                    "SOC: %{y:.2f}%<extra></extra>"
+                ),
+            )
+
+    return fig, events_df
 
 
 # --------------------------------------------------------------------
@@ -769,12 +939,35 @@ def render_onroute_panel():
 
     block_trips = row_block["block_trips"]
 
-    fig = make_block_soc_plot(
+    fig, events_df = make_block_soc_plot(
         block_trips=block_trips,
         matched_codes_onroute=matched_codes,
         mode=plot_mode,
+        candidate_df=candidate_df,   # IMPORTANT: pass the mapping table
     )
-    st.plotly_chart(fig, use_container_width=True)
+
+    sel = st.plotly_chart(
+        fig,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="points",
+    )
+
+    # Click-to-inspect (only meaningful for marker clicks)
+    if events_df is not None and not events_df.empty and sel is not None:
+        pts = sel.get("selection", {}).get("points", [])
+        if pts:
+            p = pts[0]
+            point_i = p.get("point_index", p.get("pointIndex", None))
+
+            if point_i is not None and 0 <= int(point_i) < len(events_df):
+                ev = events_df.iloc[int(point_i)]
+
+                st.markdown("##### Selected charging event")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Location", str(ev["candidate_name"]))
+                c2.metric("Session duration (min)", f"{float(ev['duration_min']):.1f}")
+                c3.metric("Energy received (kWh)", f"{float(ev['energy_kwh']):.2f}")
 
     # 4.2 Block-level results table
     st.subheader("Block-level results (depot-only vs on-route, all blocks in this scenario)")

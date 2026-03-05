@@ -3,7 +3,7 @@
 import streamlit as st
 
 from beb_blk_dashboard import render_block_panel
-from beb_onroute_dashboard_update_v2 import render_onroute_panel
+from beb_onroute_dashboard import render_onroute_panel
 from beb_trip_dashboard import render_trip_panel
 
 st.set_page_config(

@@ -45,17 +45,49 @@ def charge_session(start_soc_pct, duration_sec, max_soc_pct=90.0, n_steps=200):
 
     return float(energy_kwh), float(end_soc), ts, ps
 
+
 def _code_in_matched(code, matched_codes):
-    """
-    Robust stop-code membership check, same idea as in simulate_block.
-    """
+    """Return True if `code` is a valid stop_code that exists in matched_codes."""
     if code is None:
         return False
-    if isinstance(code, (int, float)):
+    # normalize numeric-like inputs
+    if isinstance(code, (int,)):
+        return code in matched_codes
+    if isinstance(code, float):
+        # handle NaN / float codes safely
+        if code != code:  # NaN check
+            return False
         return int(code) in matched_codes
-    if isinstance(code, str) and code.strip().isdigit():
-        return int(code.strip()) in matched_codes
+    if isinstance(code, str):
+        s = code.strip()
+        if s.isdigit():
+            return int(s) in matched_codes
     return False
+
+
+def _normalize_stop_code(code):
+    if code is None:
+        return None
+    if isinstance(code, int):
+        return code
+    if isinstance(code, float):
+        if code != code:  # NaN
+            return None
+        return int(code)
+    if isinstance(code, str):
+        s = code.strip()
+        return int(s) if s.isdigit() else None
+    return None
+
+
+def _choose_charge_stop(prev_end_code, next_start_code, matched_codes):
+    p = _normalize_stop_code(prev_end_code)
+    n = _normalize_stop_code(next_start_code)
+    if p is not None and p in matched_codes:
+        return p
+    if n is not None and n in matched_codes:
+        return n
+    return None
 
 
 def _infer_trip_distance_km(trip):
@@ -129,14 +161,21 @@ def build_block_profile_with_charging(block_trips,
     # Distance axis
     dist_cum_km = 0.0
 
-    xs = []           # distance
-    socs = []         # SOC (%)
-    net_energy = []   # net kWh remaining relative to INIT_KWH
-    phase = []   # 'start', 'drive', or 'charge'       
-    used_hist = [] # cumulative used kWh
-    charged_hist = []   # cumulative charged kWh    
+    # existing
+    xs = []
+    socs = []
+    net_energy = []
+    phase = []
+    used_hist = []
+    charged_hist = []
 
-    def record_point(dist, soc_pct, total_used, total_charged, tag):
+    # NEW: per-point charging metadata
+    stop_code_hist = []
+    charge_kwh_hist = []
+    charge_dur_s_hist = []
+
+    def record_point(dist, soc_pct, total_used, total_charged, tag,
+                     stop_code=None, charge_kwh=0.0, charge_duration_sec=0.0):
         net_kwh = MAX_ENERGY_KWH - total_used + total_charged
         xs.append(dist)
         socs.append(soc_pct)
@@ -144,6 +183,12 @@ def build_block_profile_with_charging(block_trips,
         phase.append(tag)
         used_hist.append(total_used)
         charged_hist.append(total_charged)
+
+        # NEW
+        # store stop_code consistently as string (helps downstream merging)
+        stop_code_hist.append(str(stop_code).strip() if stop_code is not None else None)
+        charge_kwh_hist.append(float(charge_kwh or 0.0))
+        charge_dur_s_hist.append(float(charge_duration_sec or 0.0)) 
 
     # Start point
     record_point(dist_cum_km, soc_pct_curr, total_used, total_charged, "start")
@@ -188,14 +233,21 @@ def build_block_profile_with_charging(block_trips,
                         total_charged += actual_delta
                         soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
 
-                        # charge point at dist_start
-                        record_point(dist_start, soc_pct_curr,
-                                     total_used, total_charged, "charge")
+                        record_point(
+                            dist_cum_km,
+                            soc_pct_curr,
+                            total_used,
+                            total_charged,
+                            "charge",
+                            stop_code=inter_start_code,
+                            charge_kwh=actual_delta,
+                            charge_duration_sec=duration_sec,
+                        )
 
                     # 2) drive the interline
                     total_used += use
                     kwh -= use
-                    kwh = min(MAX_ENERGY_KWH, kwh)
+                    kwh = max(0.0, min(MAX_ENERGY_KWH, kwh))
                     soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
 
                     record_point(dist_end, soc_pct_curr,
@@ -215,17 +267,22 @@ def build_block_profile_with_charging(block_trips,
                         total_charged += actual_delta
                         soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
 
-                        # charge point at dist_end (current dist_cum_km)
-                        record_point(dist_cum_km, soc_pct_curr,
-                                     total_used, total_charged, "charge")
-
-                    # we've fully handled this interline trip; skip generic logic below
+                        record_point(
+                            dist_cum_km,
+                            soc_pct_curr,
+                            total_used,
+                            total_charged,
+                            "charge",
+                            stop_code=inter_end_code,
+                            charge_kwh=actual_delta,
+                            charge_duration_sec=duration_sec,
+                        )
                     continue
 
         # ---------- Generic driving for all other trips (and interlines with no chargers) ----------
         total_used += use
         kwh -= use
-        kwh = min(MAX_ENERGY_KWH, kwh)
+        kwh = max(0.0, min(MAX_ENERGY_KWH, kwh))
         soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
 
         record_point(dist_end, soc_pct_curr, total_used, total_charged, "drive")
@@ -254,8 +311,16 @@ def build_block_profile_with_charging(block_trips,
                     total_charged += actual_delta
                     soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
 
-                    record_point(dist_cum_km, soc_pct_curr,
-                                 total_used, total_charged, "charge")
+                    record_point(
+                        dist_cum_km,
+                        soc_pct_curr,
+                        total_used,
+                        total_charged,
+                        "charge",
+                        stop_code=_choose_charge_stop(prev_end_code, next_start_code, matched_codes),
+                        charge_kwh=actual_delta,
+                        charge_duration_sec=duration_sec,
+                    )
 
             continue  # pull_out has no further layover logic
 
@@ -294,8 +359,16 @@ def build_block_profile_with_charging(block_trips,
                         total_charged += actual_delta
                         soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
 
-                        record_point(dist_cum_km, soc_pct_curr,
-                                     total_used, total_charged, "charge")
+                        record_point(
+                            dist_cum_km,
+                            soc_pct_curr,
+                            total_used,
+                            total_charged,
+                            "charge",
+                            stop_code=_choose_charge_stop(prev_end_code, next_start_code, matched_codes),
+                            charge_kwh=actual_delta,
+                            charge_duration_sec=duration_sec,
+                        )
 
                 continue
 
@@ -306,6 +379,11 @@ def build_block_profile_with_charging(block_trips,
         "phase": phase,
         "cum_used_kwh": used_hist,
         "cum_charged_kwh": charged_hist,
+
+        # NEW
+        "stop_code": stop_code_hist,
+        "charge_kwh": charge_kwh_hist,
+        "charge_duration_sec": charge_dur_s_hist,
     })
     return profile
 
