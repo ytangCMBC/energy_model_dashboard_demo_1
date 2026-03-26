@@ -65,7 +65,6 @@ route_id,agency_id,route_short_name,route_long_name,route_desc,route_type,route_
 39305,TL,222,Metrotown Station/Phibbs Exchange,,3,,,
 39307,TL,245,Phibbs/Capilano,,3,,,
 40855,TL,350,White Rock Centre/Crescent Beach,,3,,,
-44845,TL,900,Bike Bus/Bike Bus,,3,,,
 45596,TL,080,Marine Dr Station/River District,,3,,,
 46099,TL,102,New Westminster Station/Victoria  Hill,,3,,,
 46604,TL,R6,Scott Rd,,3,,008522,FFFFFF

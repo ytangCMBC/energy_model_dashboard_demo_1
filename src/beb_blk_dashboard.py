@@ -583,7 +583,7 @@ def render_block_panel():
 
     # Load metadata (40-ft only)
     block_inv = _load_block_summary()
-    block_inv = block_inv[block_inv["asset_class"] == "40-ft"].copy()
+    block_inv = block_inv[block_inv["asset_class_new"] == "40-ft"].copy()
 
     with st.sidebar:
         st.markdown("### Filters")
@@ -631,7 +631,7 @@ def render_block_panel():
             st.stop()
 
         # 5. Line group
-        line_group_options = sorted(df_day["line_group"].dropna().unique())
+        line_group_options = sorted(df_day["line_group"].astype(int).dropna().unique())
         line_group = st.selectbox("Line group", line_group_options)
 
         df_lg = df_day[df_day["line_group"] == line_group].copy()
@@ -640,7 +640,7 @@ def render_block_panel():
             st.stop()
 
         # 6. Block number
-        block_number_options = sorted(df_lg["block_number"].dropna().unique())
+        block_number_options = sorted(df_lg["block_number"].astype(int).dropna().unique())
         block_number = st.selectbox("Block number", block_number_options)
 
         df_final = df_lg[df_lg["block_number"] == block_number].copy()

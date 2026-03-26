@@ -1,30 +1,26 @@
-import pandas as pd
-import os
-import re
 import numpy as np
-from collections import defaultdict
-
-import json
-import ast
-import math
-from typing import Any, Dict, List, Set, Tuple
+import pandas as pd
 
 
-
-t_sec  = np.array([0, 360, 600, 1800, 2400, 2900, 3800, 4200, 4800, 5200])
-p_kw   = np.array([250, 250.2, 251.9, 258.7, 270, 230, 140, 120, 100, 80])
+t_sec = np.array([0, 360, 600, 1800, 2400, 2900, 3800, 4200, 4800, 5200])
+p_kw = np.array([250, 250.2, 251.9, 258.7, 270, 230, 140, 120, 100, 80])
 soc_pct = np.array([8, 21.9, 26.6, 49.7, 60, 70, 78, 84, 88, 90])
 
+
 def time_to_sec(tstr):
-    h, m, s = map(int, tstr.split(':'))
-    return h*3600 + m*60 + s
+    h, m, s = map(int, tstr.split(":"))
+    return h * 3600 + m * 60 + s
+
+
 def soc_to_time(s):
     s_clipped = np.clip(s, soc_pct.min(), soc_pct.max())
     return float(np.interp(s_clipped, soc_pct, t_sec))
 
+
 def time_to_soc(t):
     t_clipped = np.clip(t, t_sec.min(), t_sec.max())
     return float(np.interp(t_clipped, t_sec, soc_pct))
+
 
 def charge_session(start_soc_pct, duration_sec, max_soc_pct=90.0, n_steps=200):
     if duration_sec <= 0 or start_soc_pct >= max_soc_pct:
@@ -47,15 +43,12 @@ def charge_session(start_soc_pct, duration_sec, max_soc_pct=90.0, n_steps=200):
 
 
 def _code_in_matched(code, matched_codes):
-    """Return True if `code` is a valid stop_code that exists in matched_codes."""
     if code is None:
         return False
-    # normalize numeric-like inputs
-    if isinstance(code, (int,)):
+    if isinstance(code, int):
         return code in matched_codes
     if isinstance(code, float):
-        # handle NaN / float codes safely
-        if code != code:  # NaN check
+        if code != code:  # NaN
             return False
         return int(code) in matched_codes
     if isinstance(code, str):
@@ -91,12 +84,6 @@ def _choose_charge_stop(prev_end_code, next_start_code, matched_codes):
 
 
 def _infer_trip_distance_km(trip):
-    """
-    For now: if you don't have trip_distance_km in combine_df,
-    approximate distance from (end_time - start_time) using an
-    average speed (e.g., 30 km/h). You can replace this with
-    true distances from your combine_df later.
-    """
     if "trip_distance_km" in trip and trip["trip_distance_km"] is not None:
         return float(trip["trip_distance_km"])
 
@@ -104,39 +91,68 @@ def _infer_trip_distance_km(trip):
         t0 = time_to_sec(trip["start_time"])
         t1 = time_to_sec(trip["end_time"])
         dur_h = max(0.0, (t1 - t0) / 3600.0)
-        avg_speed_kmh = 30.0  # tweak if you want
+        avg_speed_kmh = 30.0
         return dur_h * avg_speed_kmh
 
     return 1.0
 
 
-
 BATTERY_KWH = 564.0
 MAX_SOC_FRAC = 0.90
-MAX_ENERGY_KWH = BATTERY_KWH * MAX_SOC_FRAC  
+MAX_ENERGY_KWH = BATTERY_KWH * MAX_SOC_FRAC
 INTERLINE_TYPES = {"interline"}
 
-def build_block_profile_with_charging(block_trips,
-                                      matched_codes,
-                                      mode="medium"):
+MIN_CHARGE_SEC = 180
+CHARGE_TRIGGER_SOC_PCT = 70.0
+
+
+def build_block_profile_with_charging(
+    block_trips,
+    matched_codes,
+    mode="medium",
+    layover_assume_min=8,
+    prep_time_min=3,
+    charge_trigger_soc_pct=CHARGE_TRIGGER_SOC_PCT,
+):
     """
     Build distance-based energy/SOC profile for a single block, including
-    on-route charging at:
-      - pull_out → first in_service (fixed 6 min)
-      - in_service → in_service (layover - 60 s)
-      - interline between in_service trips:
-          * if only start is a charger: charge at START of interline
-          * if end is a charger (end-only or both): charge at END of interline
+    on-route charging metadata required by the dashboard.
 
-    Returns a DataFrame with columns:
+    Returns DataFrame with:
       - dist_km
       - soc_pct
-      - net_energy_kwh   (INIT_KWH - cumulative_used + cumulative_charged)
-      - phase            ('drive' or 'charge')
+      - net_energy_kwh
+      - phase
+      - cum_used_kwh
+      - cum_charged_kwh
+      - stop_code
+      - charge_kwh
+      - charge_duration_sec
     """
-    energy_key = "energy_medium_kwh" if mode == "medium" else "energy_heavy_kwh"
+    if not block_trips:
+        return pd.DataFrame(
+            columns=[
+                "dist_km",
+                "soc_pct",
+                "net_energy_kwh",
+                "phase",
+                "cum_used_kwh",
+                "cum_charged_kwh",
+                "stop_code",
+                "charge_kwh",
+                "charge_duration_sec",
+            ]
+        )
 
-    # Copy + attach start_sec / end_sec
+    energy_key = "energy_medium_kwh" if mode == "medium" else "energy_heavy_kwh"
+    buffer_sec = int(prep_time_min * 60)
+
+    def clamp_kwh(x):
+        return min(float(MAX_ENERGY_KWH), float(x))
+
+    def soc_from_kwh(kwh_val):
+        return 100.0 * (kwh_val / float(BATTERY_KWH))
+
     trips = []
     for t in block_trips:
         t2 = dict(t)
@@ -148,183 +164,163 @@ def build_block_profile_with_charging(block_trips,
             t2["end_sec"] = None
         trips.append(t2)
 
-    # Index of first in-service
     in_idxs = [i for i, t in enumerate(trips) if t.get("type") == "in_service"]
     first_in_idx = in_idxs[0] if in_idxs else None
 
-    # Battery state
-    kwh = MAX_ENERGY_KWH
+    kwh = clamp_kwh(MAX_ENERGY_KWH)
     total_used = 0.0
     total_charged = 0.0
-    soc_pct_curr = MAX_SOC_FRAC * 100.0
+    soc_pct_curr = soc_from_kwh(kwh)
 
-    # Distance axis
     dist_cum_km = 0.0
 
-    # existing
     xs = []
     socs = []
     net_energy = []
     phase = []
     used_hist = []
     charged_hist = []
-
-    # NEW: per-point charging metadata
     stop_code_hist = []
     charge_kwh_hist = []
     charge_dur_s_hist = []
 
-    def record_point(dist, soc_pct, total_used, total_charged, tag,
-                     stop_code=None, charge_kwh=0.0, charge_duration_sec=0.0):
-        net_kwh = MAX_ENERGY_KWH - total_used + total_charged
-        xs.append(dist)
-        socs.append(soc_pct)
-        net_energy.append(net_kwh)
-        phase.append(tag)
-        used_hist.append(total_used)
-        charged_hist.append(total_charged)
+    def record_point(
+        dist,
+        soc_pct_val,
+        total_used_val,
+        total_charged_val,
+        tag,
+        stop_code=None,
+        charge_kwh=0.0,
+        charge_duration_sec=0.0,
+    ):
+        net_kwh = MAX_ENERGY_KWH - total_used_val + total_charged_val
 
-        # NEW
-        # store stop_code consistently as string (helps downstream merging)
+        xs.append(float(dist))
+        socs.append(float(soc_pct_val))
+        net_energy.append(float(net_kwh))
+        phase.append(str(tag))
+        used_hist.append(float(total_used_val))
+        charged_hist.append(float(total_charged_val))
+
         stop_code_hist.append(str(stop_code).strip() if stop_code is not None else None)
         charge_kwh_hist.append(float(charge_kwh or 0.0))
-        charge_dur_s_hist.append(float(charge_duration_sec or 0.0)) 
+        charge_dur_s_hist.append(float(charge_duration_sec or 0.0))
 
-    # Start point
+    def apply_charge_here(duration_sec, chosen_stop_code):
+        nonlocal kwh, total_charged, soc_pct_curr
+
+        if duration_sec < MIN_CHARGE_SEC:
+            return False
+        if soc_pct_curr >= charge_trigger_soc_pct:
+            return False
+
+        delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
+
+        kwh_before = kwh
+        kwh = clamp_kwh(kwh + delta_e)
+        actual_delta = kwh - kwh_before
+
+        if actual_delta <= 0:
+            return False
+
+        total_charged += actual_delta
+        soc_pct_curr = soc_from_kwh(kwh)
+
+        record_point(
+            dist_cum_km,
+            soc_pct_curr,
+            total_used,
+            total_charged,
+            "charge",
+            stop_code=chosen_stop_code,
+            charge_kwh=actual_delta,
+            charge_duration_sec=duration_sec,
+        )
+        return True
+
     record_point(dist_cum_km, soc_pct_curr, total_used, total_charged, "start")
 
-    # ---------- Main trip loop ----------
     for i, trip in enumerate(trips):
         ttype = trip.get("type")
-
         use = float(trip.get(energy_key, 0.0) or 0.0)
         dist_km = _infer_trip_distance_km(trip)
 
         dist_start = dist_cum_km
         dist_end = dist_cum_km + dist_km
 
-        # ---------- Special handling: interline NIS between in_service trips ----------
+        # -------- interline special handling --------
         if ttype in INTERLINE_TYPES and 0 < i < len(trips) - 1:
             prev_trip = trips[i - 1]
             next_trip = trips[i + 1]
 
-            if (
-                prev_trip.get("type") == "in_service"
-                and next_trip.get("type") == "in_service"
-            ):
+            if prev_trip.get("type") == "in_service" and next_trip.get("type") == "in_service":
                 inter_start_code = trip.get("start_stop_code")
                 inter_end_code = trip.get("end_stop_code")
 
                 has_start = _code_in_matched(inter_start_code, matched_codes)
                 has_end = _code_in_matched(inter_end_code, matched_codes)
 
-                # Only do special logic if at least one end is a charger
                 if has_start or has_end:
-                    # 1) start-only: charge at BEGINNING of interline
+                    # charge at start only when start is charger and end is not
                     if has_start and not has_end:
-                        duration_sec = 5 * 60
-                        delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
+                        duration_sec = max(0, layover_assume_min * 60 - buffer_sec)
+                        apply_charge_here(duration_sec, inter_start_code)
 
-                        kwh_before = kwh
-                        kwh += delta_e
-                        if kwh > MAX_ENERGY_KWH:
-                            kwh = MAX_ENERGY_KWH
-                        actual_delta = kwh - kwh_before
-                        total_charged += actual_delta
-                        soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
-
-                        record_point(
-                            dist_cum_km,
-                            soc_pct_curr,
-                            total_used,
-                            total_charged,
-                            "charge",
-                            stop_code=inter_start_code,
-                            charge_kwh=actual_delta,
-                            charge_duration_sec=duration_sec,
-                        )
-
-                    # 2) drive the interline
+                    # drive interline
                     total_used += use
-                    kwh -= use
-                    kwh = max(0.0, min(MAX_ENERGY_KWH, kwh))
-                    soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
+                    kwh = clamp_kwh(kwh - use)
+                    soc_pct_curr = soc_from_kwh(kwh)
 
-                    record_point(dist_end, soc_pct_curr,
-                                 total_used, total_charged, "drive")
+                    record_point(
+                        dist_end,
+                        soc_pct_curr,
+                        total_used,
+                        total_charged,
+                        "drive",
+                    )
                     dist_cum_km = dist_end
 
-                    # 3) end-only OR both: charge at END of interline
+                    # charge at end if end exists
                     if has_end:
-                        duration_sec = 5 * 60
-                        delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
+                        duration_sec = max(0, layover_assume_min * 60 - buffer_sec)
+                        apply_charge_here(duration_sec, inter_end_code)
 
-                        kwh_before = kwh
-                        kwh += delta_e
-                        if kwh > MAX_ENERGY_KWH:
-                            kwh = MAX_ENERGY_KWH
-                        actual_delta = kwh - kwh_before
-                        total_charged += actual_delta
-                        soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
-
-                        record_point(
-                            dist_cum_km,
-                            soc_pct_curr,
-                            total_used,
-                            total_charged,
-                            "charge",
-                            stop_code=inter_end_code,
-                            charge_kwh=actual_delta,
-                            charge_duration_sec=duration_sec,
-                        )
                     continue
 
-        # ---------- Generic driving for all other trips (and interlines with no chargers) ----------
+        # -------- generic driving --------
         total_used += use
-        kwh -= use
-        kwh = max(0.0, min(MAX_ENERGY_KWH, kwh))
-        soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
+        kwh = clamp_kwh(kwh - use)
+        soc_pct_curr = soc_from_kwh(kwh)
 
-        record_point(dist_end, soc_pct_curr, total_used, total_charged, "drive")
+        record_point(
+            dist_end,
+            soc_pct_curr,
+            total_used,
+            total_charged,
+            "drive",
+        )
         dist_cum_km = dist_end
 
-        # ---------- Pull-out → first in-service charging ----------
+        # -------- pull_out -> first in_service --------
         if ttype == "pull_out" and first_in_idx is not None:
             next_trip = trips[first_in_idx]
             prev_end_code = trip.get("end_stop_code")
             next_start_code = next_trip.get("start_stop_code")
 
             eligible = (
-                _code_in_matched(prev_end_code, matched_codes) or
-                _code_in_matched(next_start_code, matched_codes)
+                _code_in_matched(prev_end_code, matched_codes)
+                or _code_in_matched(next_start_code, matched_codes)
             )
+
             if eligible:
-                duration_sec = 5 * 60  # fixed 5 min
-                if duration_sec > 0:
-                    delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
+                chosen_stop = _choose_charge_stop(prev_end_code, next_start_code, matched_codes)
+                duration_sec = max(0, layover_assume_min * 60 - buffer_sec)
+                apply_charge_here(duration_sec, chosen_stop)
 
-                    kwh_before = kwh
-                    kwh += delta_e
-                    if kwh > MAX_ENERGY_KWH:
-                        kwh = MAX_ENERGY_KWH
-                    actual_delta = kwh - kwh_before
-                    total_charged += actual_delta
-                    soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
+            continue
 
-                    record_point(
-                        dist_cum_km,
-                        soc_pct_curr,
-                        total_used,
-                        total_charged,
-                        "charge",
-                        stop_code=_choose_charge_stop(prev_end_code, next_start_code, matched_codes),
-                        charge_kwh=actual_delta,
-                        charge_duration_sec=duration_sec,
-                    )
-
-            continue  # pull_out has no further layover logic
-
-        # ---------- In-service charging: in_service → in_service ----------
+        # -------- in_service -> in_service layover --------
         if ttype == "in_service" and i < len(trips) - 1:
             next_trip = trips[i + 1]
 
@@ -341,51 +337,28 @@ def build_block_profile_with_charging(block_trips,
                 next_start_code = next_trip.get("start_stop_code")
 
                 eligible = (
-                    _code_in_matched(prev_end_code, matched_codes) or
-                    _code_in_matched(next_start_code, matched_codes)
+                    _code_in_matched(prev_end_code, matched_codes)
+                    or _code_in_matched(next_start_code, matched_codes)
                 )
 
                 if eligible:
-                    duration_sec = max(0, layover - 120)  # minus 2 min prep
-                    if duration_sec > 0:
-                        delta_e, _, _, _ = charge_session(soc_pct_curr, duration_sec)
-
-                        kwh_before = kwh
-                        kwh += delta_e
-                        if kwh > MAX_ENERGY_KWH:
-                            kwh = MAX_ENERGY_KWH
-
-                        actual_delta = kwh - kwh_before
-                        total_charged += actual_delta
-                        soc_pct_curr = 100.0 * (kwh / BATTERY_KWH)
-
-                        record_point(
-                            dist_cum_km,
-                            soc_pct_curr,
-                            total_used,
-                            total_charged,
-                            "charge",
-                            stop_code=_choose_charge_stop(prev_end_code, next_start_code, matched_codes),
-                            charge_kwh=actual_delta,
-                            charge_duration_sec=duration_sec,
-                        )
+                    chosen_stop = _choose_charge_stop(prev_end_code, next_start_code, matched_codes)
+                    duration_sec = max(0, layover - buffer_sec)
+                    apply_charge_here(duration_sec, chosen_stop)
 
                 continue
 
-    profile = pd.DataFrame({
-        "dist_km": xs,
-        "soc_pct": socs,
-        "net_energy_kwh": net_energy,
-        "phase": phase,
-        "cum_used_kwh": used_hist,
-        "cum_charged_kwh": charged_hist,
-
-        # NEW
-        "stop_code": stop_code_hist,
-        "charge_kwh": charge_kwh_hist,
-        "charge_duration_sec": charge_dur_s_hist,
-    })
+    profile = pd.DataFrame(
+        {
+            "dist_km": xs,
+            "soc_pct": socs,
+            "net_energy_kwh": net_energy,
+            "phase": phase,
+            "cum_used_kwh": used_hist,
+            "cum_charged_kwh": charged_hist,
+            "stop_code": stop_code_hist,
+            "charge_kwh": charge_kwh_hist,
+            "charge_duration_sec": charge_dur_s_hist,
+        }
+    )
     return profile
-
-
-
