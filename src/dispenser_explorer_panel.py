@@ -708,9 +708,32 @@ def render_dispenser_explorer_panel():
     # =========================
     # Raw records
     # =========================
-    st.markdown("### Raw charging-session records (selected hour)")
-    if win_events.empty:
-        st.info("No records in the selected hour.")
+    raw_scope = st.radio(
+        "Raw charging-session records scope",
+        ["Selected hour", "Whole day"],
+        index=0,
+        horizontal=True,
+        key="dispenser_raw_records_scope",
+    )
+    raw_events = win_events if raw_scope == "Selected hour" else cand_events
+    raw_scope_note = (
+        f"Selected hour: {window_title}"
+        if raw_scope == "Selected hour"
+        else "Whole selected service day"
+    )
+
+    st.markdown(f"### Raw charging-session records ({raw_scope.lower()})")
+    st.caption(
+        f"{raw_scope_note} | Candidate: {sel_candidate} | Mode: {sel_mode} | "
+        f"Service day: {sel_service_day} | "
+        f"Categories: {', '.join(sel_categories) if sel_categories else 'None'}"
+    )
+    if raw_events.empty:
+        st.info(
+            "No records in the selected hour."
+            if raw_scope == "Selected hour"
+            else "No records for the selected day and filters."
+        )
     else:
         raw_cols = [
             "candidate_name",
@@ -741,8 +764,8 @@ def render_dispenser_explorer_panel():
             "start_sec", 
             "end_sec"
         ]
-        raw_cols = [c for c in raw_cols if c in win_events.columns]
-        raw_df = win_events.loc[:, raw_cols].copy()
+        raw_cols = [c for c in raw_cols if c in raw_events.columns]
+        raw_df = raw_events.loc[:, raw_cols].copy()
         raw_df = raw_df.sort_values(["start_sec", "end_sec"], ascending=[True, True]).reset_index(drop=True)
         st.dataframe(raw_df, width="stretch", height=320)
 
