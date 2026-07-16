@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 from typing import Dict, List
 
+import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -25,6 +25,7 @@ from onroute_fcfs_helpers_update import (
     dispensers_needed_by_candidate,
     scenario_output_dir,
     persist_scenario_artifacts,
+    prune_scenario_artifacts,
     time_to_sec,
     _infer_trip_distance_km,
     _normalize_stop_code,
@@ -40,8 +41,11 @@ BLOCK_SUMMARY_PATH = OUT_ROOT / "block_success_summary_depot_only.parquet"
 CANDIDATE_STOP_MAP_PATH = OUT_ROOT / "candidate_stop_map.parquet"
 FCFS_CACHE_DIR = OUT_ROOT / "onroute_fcfs_cache"
 BUS_STOPS_EXPORT_PATH = OUT_ROOT / "bus_stops_df_export.xlsx"
+RUNTIME_SCENARIO_COLLECTION = "onroute_fcfs_runtime_scenarios"
+MAX_SESSION_SCENARIOS = 3
+MAX_SAVED_SCENARIOS = 10
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_block_summary(path: str | Path) -> pd.DataFrame:
     df = pd.read_parquet(path)
     df = df[df["asset_class_new"] == "40-ft"].copy()
@@ -52,7 +56,7 @@ def load_block_summary(path: str | Path) -> pd.DataFrame:
     })
     return df
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_trip_to_route_short_name(gtfs_dir: str | Path) -> Dict[str, str]:
     gtfs_dir = Path(gtfs_dir)
     trips = pd.read_csv(gtfs_dir / "trips.txt", dtype=str, low_memory=False)[["trip_id", "route_id"]].dropna()
@@ -60,7 +64,7 @@ def load_trip_to_route_short_name(gtfs_dir: str | Path) -> Dict[str, str]:
     merged = trips.merge(routes, on="route_id", how="left")
     return dict(zip(merged["trip_id"], merged["route_short_name"]))
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_bus_stops_export(path: str | Path) -> pd.DataFrame:
     df = pd.read_excel(path).copy()
 
@@ -119,7 +123,7 @@ def load_bus_stops_export(path: str | Path) -> pd.DataFrame:
     df = df[["stop_code", "stop_name_simple"]].drop_duplicates(subset=["stop_code"], keep="first").copy()
     return df
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_gtfs_stops(gtfs_dir: str | Path) -> pd.DataFrame:
     gtfs_dir = Path(gtfs_dir)
 
@@ -163,7 +167,7 @@ def load_gtfs_stops(gtfs_dir: str | Path) -> pd.DataFrame:
     df = df[["stop_code", "stop_name"]].drop_duplicates(subset=["stop_code"], keep="first").copy()
     return df
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def build_combined_stop_name_map(
     bus_stop_export_path: str | Path,
     gtfs_dir: str | Path,
@@ -189,20 +193,24 @@ def build_combined_stop_name_map(
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4)
 def prepare_base_events(
     block_summary_path: str | Path,
     candidate_stop_map_path: str | Path,
     gtfs_dir: str | Path,
     sim_mode: str,
     proposal_mode: str = "heavy",
+    exclude_p1: bool = False,
 ):
     blocks = load_block_summary(block_summary_path)
     candidate_df = load_candidate_stop_map(candidate_stop_map_path)
 
+    sim_blocks = _filter_p1_blocks(blocks, sim_mode) if exclude_p1 else blocks
+    proposal_blocks = _filter_p1_blocks(blocks, proposal_mode) if exclude_p1 else blocks
+
     # 1) events used for current selected duty simulation
     events_df, _ = build_final_proposed_dispensers(
-        blocks_df=blocks,
+        blocks_df=sim_blocks,
         candidate_df=candidate_df,
         gtfs_dir=gtfs_dir,
         mode=sim_mode,
@@ -210,7 +218,7 @@ def prepare_base_events(
 
     # 2) proposed dispensers always based on heavy duty
     _, disp_final = build_final_proposed_dispensers(
-        blocks_df=blocks,
+        blocks_df=proposal_blocks,
         candidate_df=candidate_df,
         gtfs_dir=gtfs_dir,
         mode=proposal_mode,
@@ -219,249 +227,243 @@ def prepare_base_events(
     return blocks, candidate_df, events_df, disp_final
 
 
-def _scenario_key(installed_disp: Dict[str, int], duty_key: str) -> str:
-    text = duty_key + "|" + "|".join(f"{k}:{installed_disp[k]}" for k in sorted(installed_disp))
+def _filter_p1_blocks(blocks: pd.DataFrame, duty_key: str) -> pd.DataFrame:
+    success_col = f"{duty_key}_success_depot_only"
+    if success_col not in blocks.columns:
+        return blocks.copy()
+
+    success = (
+        blocks[success_col].eq(True)
+        | blocks[success_col].astype(str).str.upper().eq("SUCCESS")
+    )
+    return blocks.loc[~success].copy()
+
+
+def _scenario_key(installed_disp: Dict[str, int], duty_key: str, exclude_p1: bool) -> str:
+    p1_scope = "exclude_p1" if exclude_p1 else "include_p1"
+    text = duty_key + "|" + p1_scope + "|" + "|".join(f"{k}:{installed_disp[k]}" for k in sorted(installed_disp))
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
 
-def _disp_key(duty_key: str, candidate_name: str) -> str:
-    return f"disp_{duty_key}_{candidate_name}"
+def _disp_key(duty_key: str, p1_scope_key: str, candidate_name: str) -> str:
+    return f"disp_{duty_key}_{p1_scope_key}_{candidate_name}"
 
 
-def _set_all_dispensers(candidate_names: List[str], proposed_map: Dict[str, int], duty_key: str, value_mode: str) -> None:
+def _set_all_dispensers(
+    candidate_names: List[str],
+    proposed_map: Dict[str, int],
+    duty_key: str,
+    p1_scope_key: str,
+    value_mode: str,
+) -> None:
     for name in candidate_names:
-        key = _disp_key(duty_key, name)
+        key = _disp_key(duty_key, p1_scope_key, name)
         if value_mode == "clear":
             st.session_state[key] = 0
         elif value_mode == "reset":
             st.session_state[key] = int(proposed_map.get(name, 0))
 
 
-def _set_one_dispenser(candidate_name: str, proposed_map: Dict[str, int], duty_key: str, value_mode: str) -> None:
-    key = _disp_key(duty_key, candidate_name)
+def _set_one_dispenser(
+    candidate_name: str,
+    proposed_map: Dict[str, int],
+    duty_key: str,
+    p1_scope_key: str,
+    value_mode: str,
+) -> None:
+    key = _disp_key(duty_key, p1_scope_key, candidate_name)
     if value_mode == "clear":
         st.session_state[key] = 0
     elif value_mode == "reset":
         st.session_state[key] = int(proposed_map.get(candidate_name, 0))
 
 
-def make_depot_metric_charts(report_df: pd.DataFrame, duty: str):
-    """
-    Return three depot-level charts for the selected duty only:
-    1. successful block count
-    2. success rate
-    3. BEB distance KM
+def _clear_scenario_memory() -> None:
+    st.session_state["fcfs_scenario_cache"] = {}
+    st.session_state["fcfs_scenario_order"] = []
 
-    Each chart compares Depot-only vs On-route (FCFS).
-    """
+
+def _touch_scenario_cache_key(scenario_key: str) -> None:
+    order = st.session_state.setdefault("fcfs_scenario_order", [])
+    if scenario_key in order:
+        order.remove(scenario_key)
+    order.append(scenario_key)
+
+
+def _remember_scenario(scenario_key: str, data: dict) -> None:
+    cache = st.session_state.setdefault("fcfs_scenario_cache", {})
+    cache[scenario_key] = data
+    _touch_scenario_cache_key(scenario_key)
+
+    order = st.session_state.setdefault("fcfs_scenario_order", [])
+    while len(order) > MAX_SESSION_SCENARIOS:
+        old_key = order.pop(0)
+        if old_key != scenario_key:
+            cache.pop(old_key, None)
+
+
+def _service_day_sort_key(service_day: str) -> tuple[int, str]:
+    order = {"MF": 0, "WEEKDAY": 0, "SAT": 1, "SATURDAY": 1, "SUN": 2, "SUNDAY": 2}
+    label = str(service_day).upper()
+    return order.get(label, 99), str(service_day)
+
+
+def make_depot_service_heatmaps(report_df: pd.DataFrame, duty: str):
     if report_df.empty:
         return go.Figure(), go.Figure(), go.Figure()
 
     success_depot_col = f"{duty}_success_depot_only"
     success_onroute_col = f"{duty}_success_on_route_charge"
+    dist_col = "total_distance_km"
 
     df = report_df.copy()
     df["depot_code"] = df["depot_code"].astype(str)
-    dist_col = "total_distance_km"
-
-    grouped = (
-        df.groupby("depot_code", dropna=False)
-        .agg(
-            total_blocks=("block_id", "count"),
-            success_blocks_depot=(success_depot_col, lambda s: (s == "SUCCESS").sum()),
-            success_blocks_onroute=(success_onroute_col, lambda s: (s == "SUCCESS").sum()),
-            beb_km_depot=(
-                dist_col,
-                lambda s: df.loc[s.index]
-                .loc[df.loc[s.index, success_depot_col] == "SUCCESS", dist_col]
-                .sum(),
-            ),
-            beb_km_onroute=(
-                dist_col,
-                lambda s: df.loc[s.index]
-                .loc[df.loc[s.index, success_onroute_col] == "SUCCESS", dist_col]
-                .sum(),
-            ),
-        )
-        .reset_index()
-    )
-
-    grouped["success_rate_depot"] = grouped["success_blocks_depot"] / grouped["total_blocks"] * 100.0
-    grouped["success_rate_onroute"] = grouped["success_blocks_onroute"] / grouped["total_blocks"] * 100.0
-
-    # 1) Successful block count chart
-    block_long = grouped.melt(
-        id_vars=["depot_code"],
-        value_vars=["success_blocks_depot", "success_blocks_onroute"],
-        var_name="scenario",
-        value_name="block_count",
-    )
-    block_long["scenario"] = block_long["scenario"].map({
-        "success_blocks_depot": "Depot-only",
-        "success_blocks_onroute": "On-route (FCFS)",
-    })
-
-    fig_blocks = px.bar(
-        block_long,
-        x="depot_code",
-        y="block_count",
-        color="scenario",
-        barmode="group",
-        title=f"Successful Block Number by Depot ({duty.capitalize()} duty)",
-    )
-
-    # 2) Success rate chart
-    rate_long = grouped.melt(
-        id_vars=["depot_code"],
-        value_vars=["success_rate_depot", "success_rate_onroute"],
-        var_name="scenario",
-        value_name="success_rate",
-    )
-    rate_long["scenario"] = rate_long["scenario"].map({
-        "success_rate_depot": "Depot-only",
-        "success_rate_onroute": "On-route (FCFS)",
-    })
-
-    fig_rate = px.bar(
-        rate_long,
-        x="depot_code",
-        y="success_rate",
-        color="scenario",
-        barmode="group",
-        title=f"Success Rate by Depot ({duty.capitalize()} duty)",
-    )
-
-    # 3) BEB distance chart
-    km_long = grouped.melt(
-        id_vars=["depot_code"],
-        value_vars=["beb_km_depot", "beb_km_onroute"],
-        var_name="scenario",
-        value_name="beb_km",
-    )
-    km_long["scenario"] = km_long["scenario"].map({
-        "beb_km_depot": "Depot-only",
-        "beb_km_onroute": "On-route (FCFS)",
-    })
-
-    fig_km = px.bar(
-        km_long,
-        x="depot_code",
-        y="beb_km",
-        color="scenario",
-        barmode="group",
-        title=f"BEB Distance KM by Depot ({duty.capitalize()} duty)",
-    )
-
-    return fig_blocks, fig_rate, fig_km
-
-
-def make_service_day_metric_charts(report_df: pd.DataFrame, duty: str):
-    """
-    Return three service-day-level charts for the selected duty only:
-    1. successful block count
-    2. success rate
-    3. BEB distance KM
-
-    Each chart compares Depot-only vs On-route (FCFS).
-    """
-    if report_df.empty:
-        return go.Figure(), go.Figure(), go.Figure()
-
-    success_depot_col = f"{duty}_success_depot_only"
-    success_onroute_col = f"{duty}_success_on_route_charge"
-
-    df = report_df.copy()
     df["service_day"] = df["service_day"].astype(str)
-    dist_col = "total_distance_km"
+    df[dist_col] = pd.to_numeric(df[dist_col], errors="coerce").fillna(0.0)
 
     grouped = (
-        df.groupby("service_day", dropna=False)
+        df.groupby(["depot_code", "service_day"], dropna=False)
         .agg(
             total_blocks=("block_id", "count"),
-            success_blocks_depot=(success_depot_col, lambda s: (s == "SUCCESS").sum()),
-            success_blocks_onroute=(success_onroute_col, lambda s: (s == "SUCCESS").sum()),
+            success_blocks_depot=(success_depot_col, lambda s: int((s == "SUCCESS").sum())),
+            success_blocks_onroute=(success_onroute_col, lambda s: int((s == "SUCCESS").sum())),
             beb_km_depot=(
                 dist_col,
-                lambda s: df.loc[s.index]
-                .loc[df.loc[s.index, success_depot_col] == "SUCCESS", dist_col]
-                .sum(),
+                lambda s: float(df.loc[s.index].loc[df.loc[s.index, success_depot_col] == "SUCCESS", dist_col].sum()),
             ),
             beb_km_onroute=(
                 dist_col,
-                lambda s: df.loc[s.index]
-                .loc[df.loc[s.index, success_onroute_col] == "SUCCESS", dist_col]
-                .sum(),
+                lambda s: float(df.loc[s.index].loc[df.loc[s.index, success_onroute_col] == "SUCCESS", dist_col].sum()),
             ),
         )
         .reset_index()
     )
-    grouped["success_rate_depot"] = grouped["success_blocks_depot"] / grouped["total_blocks"] * 100.0
-    grouped["success_rate_onroute"] = grouped["success_blocks_onroute"] / grouped["total_blocks"] * 100.0
-
-    day_order = [d for d in ["MF", "Sat", "Sun"] if d in grouped["service_day"].tolist()]
-    remaining = [d for d in grouped["service_day"].tolist() if d not in day_order]
-    full_order = day_order + sorted(remaining)
-
-    block_long = grouped.melt(
-        id_vars=["service_day"],
-        value_vars=["success_blocks_depot", "success_blocks_onroute"],
-        var_name="scenario",
-        value_name="block_count",
+    grouped["success_rate_depot"] = np.where(
+        grouped["total_blocks"] > 0,
+        grouped["success_blocks_depot"] / grouped["total_blocks"] * 100.0,
+        0.0,
     )
-    block_long["scenario"] = block_long["scenario"].map({
-        "success_blocks_depot": "Depot-only",
-        "success_blocks_onroute": "On-route (FCFS)",
-    })
+    grouped["success_rate_onroute"] = np.where(
+        grouped["total_blocks"] > 0,
+        grouped["success_blocks_onroute"] / grouped["total_blocks"] * 100.0,
+        0.0,
+    )
+    grouped["unlocked_blocks"] = grouped["success_blocks_onroute"] - grouped["success_blocks_depot"]
+    grouped["success_rate_delta"] = grouped["success_rate_onroute"] - grouped["success_rate_depot"]
+    grouped["beb_km_delta"] = grouped["beb_km_onroute"] - grouped["beb_km_depot"]
 
-    fig_blocks = px.bar(
-        block_long,
-        x="service_day",
-        y="block_count",
-        color="scenario",
-        barmode="group",
-        category_orders={"service_day": full_order},
-        title=f"Successful Block Number by Service Day ({duty.capitalize()} duty)",
+    depots = sorted(grouped["depot_code"].dropna().unique().tolist())
+    service_days = sorted(grouped["service_day"].dropna().unique().tolist(), key=_service_day_sort_key)
+
+    metric_fields = [
+        "total_blocks",
+        "success_blocks_depot",
+        "success_blocks_onroute",
+        "unlocked_blocks",
+        "success_rate_depot",
+        "success_rate_onroute",
+        "success_rate_delta",
+        "beb_km_depot",
+        "beb_km_onroute",
+        "beb_km_delta",
+    ]
+
+    indexed = grouped.set_index(["depot_code", "service_day"])
+
+    def matrix_for(field: str) -> list[list[float]]:
+        rows = []
+        for depot in depots:
+            vals = []
+            for service_day in service_days:
+                if (depot, service_day) in indexed.index:
+                    vals.append(float(indexed.loc[(depot, service_day), field]))
+                else:
+                    vals.append(0.0)
+            rows.append(vals)
+        return rows
+
+    customdata = []
+    for depot in depots:
+        row = []
+        for service_day in service_days:
+            if (depot, service_day) in indexed.index:
+                rec = indexed.loc[(depot, service_day)]
+                row.append([rec[field] for field in metric_fields])
+            else:
+                row.append([0 for _ in metric_fields])
+        customdata.append(row)
+
+    hovertemplate = (
+        "<b>%{y} - %{x}</b><br>"
+        "Total blocks: %{customdata[0]:,.0f}<br>"
+        "<br><b>Depot-only</b><br>"
+        "Success blocks: %{customdata[1]:,.0f}<br>"
+        "Success rate: %{customdata[4]:.1f}%<br>"
+        "BEB distance: %{customdata[7]:,.1f} km<br>"
+        "<br><b>On-route</b><br>"
+        "Success blocks: %{customdata[2]:,.0f}<br>"
+        "Success rate: %{customdata[5]:.1f}%<br>"
+        "BEB distance: %{customdata[8]:,.1f} km<br>"
+        "<br><b>Change</b><br>"
+        "Unlocked blocks: %{customdata[3]:+,.0f}<br>"
+        "Rate delta: %{customdata[6]:+.1f} pts<br>"
+        "Distance delta: %{customdata[9]:+,.1f} km"
+        "<extra></extra>"
     )
 
-    rate_long = grouped.melt(
-        id_vars=["service_day"],
-        value_vars=["success_rate_depot", "success_rate_onroute"],
-        var_name="scenario",
-        value_name="success_rate",
-    )
-    rate_long["scenario"] = rate_long["scenario"].map({
-        "success_rate_depot": "Depot-only",
-        "success_rate_onroute": "On-route (FCFS)",
-    })
+    business_green_scale = [
+        [0.00, "#f7faf7"],
+        [0.25, "#dcebdd"],
+        [0.50, "#a9cfac"],
+        [0.75, "#5f9f68"],
+        [1.00, "#2f6f3e"],
+    ]
 
-    fig_rate = px.bar(
-        rate_long,
-        x="service_day",
-        y="success_rate",
-        color="scenario",
-        barmode="group",
-        category_orders={"service_day": full_order},
-        title=f"Success Rate by Service Day ({duty.capitalize()} duty)",
-    )
+    def build_heatmap(metric: str, title: str, colorbar_title: str, text_format: str, text_suffix: str = ""):
+        z = matrix_for(metric)
+        text = [[f"{format(v, text_format)}{text_suffix}" for v in row] for row in z]
+        fig = go.Figure(
+            data=go.Heatmap(
+                z=z,
+                x=service_days,
+                y=depots,
+                customdata=customdata,
+                text=text,
+                texttemplate="%{text}",
+                hovertemplate=hovertemplate,
+                colorscale=business_green_scale,
+                colorbar=dict(title=colorbar_title, outlinewidth=0),
+            )
+        )
+        fig.update_layout(
+            title=title,
+            xaxis_title="Service day",
+            yaxis_title="Depot",
+            height=max(360, 110 + 32 * len(depots)),
+            margin=dict(l=10, r=10, t=55, b=10),
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+        )
+        return fig
 
-    km_long = grouped.melt(
-        id_vars=["service_day"],
-        value_vars=["beb_km_depot", "beb_km_onroute"],
-        var_name="scenario",
-        value_name="beb_km",
+    fig_blocks = build_heatmap(
+        "unlocked_blocks",
+        f"Unlocked Blocks by Depot and Service Day (Blocks, {duty.capitalize()} duty)",
+        "Blocks",
+        "+.0f",
     )
-    km_long["scenario"] = km_long["scenario"].map({
-        "beb_km_depot": "Depot-only",
-        "beb_km_onroute": "On-route (FCFS)",
-    })
-
-    fig_km = px.bar(
-        km_long,
-        x="service_day",
-        y="beb_km",
-        color="scenario",
-        barmode="group",
-        category_orders={"service_day": full_order},
-        title=f"BEB Distance KM by Service Day ({duty.capitalize()} duty)",
+    fig_rate = build_heatmap(
+        "success_rate_delta",
+        f"Success Rate Improvement by Depot and Service Day (%, {duty.capitalize()} duty)",
+        "%",
+        "+.1f",
+        "%",
+    )
+    fig_km = build_heatmap(
+        "beb_km_delta",
+        f"BEB Distance Improvement by Depot and Service Day (KM, {duty.capitalize()} duty)",
+        "KM",
+        "+.0f",
+        " KM",
     )
 
     return fig_blocks, fig_rate, fig_km
@@ -1087,15 +1089,57 @@ def render_onroute_panel():
     st.markdown("## On-Route Charge Summary Panel")
 
     if "fcfs_scenario_cache" not in st.session_state:
-        st.session_state["fcfs_scenario_cache"] = {}
+        _clear_scenario_memory()
+    if "fcfs_saved_scenarios_pruned" not in st.session_state:
+        prune_scenario_artifacts(
+            OUT_ROOT,
+            keep_latest=MAX_SAVED_SCENARIOS,
+            collection_name=RUNTIME_SCENARIO_COLLECTION,
+        )
+        st.session_state["fcfs_saved_scenarios_pruned"] = True
 
     with st.sidebar:
         st.header("Scenario controls")
         duty = st.radio("Duty / energy mode", ["Heavy-duty", "Medium-duty"], index=0)
         duty_key = "heavy" if duty.startswith("Heavy") else "medium"
+        p1_scope = st.radio(
+            "P1 block handling",
+            ["Exclude P1 blocks", "Include P1 blocks"],
+            index=0,
+            horizontal=True,
+        )
+        exclude_p1 = p1_scope.startswith("Exclude")
+        p1_scope_key = "exclude_p1" if exclude_p1 else "include_p1"
+
+        st.header("Memory controls")
+        save_scenario_outputs = st.checkbox(
+            "Save scenario outputs to disk",
+            value=False,
+            help="Off by default to avoid accumulating large scenario files.",
+        )
+        saved_scenarios_to_keep = st.number_input(
+            "Saved scenario folders to keep",
+            min_value=1,
+            max_value=50,
+            value=MAX_SAVED_SCENARIOS,
+            step=1,
+            disabled=not save_scenario_outputs,
+        )
+        if st.button("Clear scenario memory", width="stretch"):
+            _clear_scenario_memory()
+            st.rerun()
+        st.caption(
+            f"In memory: current run plus up to {MAX_SESSION_SCENARIOS - 1} recent runs. "
+            "Restarting the dashboard starts with an empty scenario memory."
+        )
 
     blocks_base, candidate_df, events_df, disp_final = prepare_base_events(
-        BLOCK_SUMMARY_PATH, CANDIDATE_STOP_MAP_PATH, GTFS_DIR, duty_key, proposal_mode="heavy",
+        BLOCK_SUMMARY_PATH,
+        CANDIDATE_STOP_MAP_PATH,
+        GTFS_DIR,
+        duty_key,
+        proposal_mode="heavy",
+        exclude_p1=exclude_p1,
     )
 
     if blocks_base.empty:
@@ -1116,12 +1160,12 @@ def render_onroute_panel():
 
         top_c1, top_c2 = st.columns(2)
         with top_c1:
-            if st.button("Clear all", key=f"clear_all_{duty_key}", width="stretch"):
-                _set_all_dispensers(candidate_names, proposed_map, duty_key, "clear")
+            if st.button("Clear all", key=f"clear_all_{duty_key}_{p1_scope_key}", width="stretch"):
+                _set_all_dispensers(candidate_names, proposed_map, duty_key, p1_scope_key, "clear")
                 st.rerun()
         with top_c2:
-            if st.button("Reset all", key=f"reset_all_{duty_key}", width="stretch"):
-                _set_all_dispensers(candidate_names, proposed_map, duty_key, "reset")
+            if st.button("Reset all", key=f"reset_all_{duty_key}_{p1_scope_key}", width="stretch"):
+                _set_all_dispensers(candidate_names, proposed_map, duty_key, p1_scope_key, "reset")
                 st.rerun()
 
         st.caption("Expand the list below to adjust installed dispensers by location.")
@@ -1131,7 +1175,7 @@ def render_onroute_panel():
         with st.expander("Locations", expanded=False):
             for name in candidate_names:
                 max_n = int(proposed_map.get(name, 0))
-                key = _disp_key(duty_key, name)
+                key = _disp_key(duty_key, p1_scope_key, name)
 
                 if key not in st.session_state:
                     st.session_state[key] = max_n
@@ -1139,12 +1183,12 @@ def render_onroute_panel():
                 with st.expander(f"{name}  (proposed: {max_n})", expanded=False):
                     row_c1, row_c2 = st.columns(2)
                     with row_c1:
-                        if st.button("Clear", key=f"clear_{duty_key}_{name}", width="stretch"):
-                            _set_one_dispenser(name, proposed_map, duty_key, "clear")
+                        if st.button("Clear", key=f"clear_{duty_key}_{p1_scope_key}_{name}", width="stretch"):
+                            _set_one_dispenser(name, proposed_map, duty_key, p1_scope_key, "clear")
                             st.rerun()
                     with row_c2:
-                        if st.button("Reset", key=f"reset_{duty_key}_{name}", width="stretch"):
-                            _set_one_dispenser(name, proposed_map, duty_key, "reset")
+                        if st.button("Reset", key=f"reset_{duty_key}_{p1_scope_key}_{name}", width="stretch"):
+                            _set_one_dispenser(name, proposed_map, duty_key, p1_scope_key, "reset")
                             st.rerun()
 
                     st.number_input(
@@ -1160,7 +1204,7 @@ def render_onroute_panel():
 
         st.caption("Reset = proposed value. Clear = 0.")
 
-    scenario_key = _scenario_key(installed_disp, duty_key)
+    scenario_key = _scenario_key(installed_disp, duty_key, exclude_p1)
     cache = st.session_state["fcfs_scenario_cache"]
 
     if scenario_key not in cache:
@@ -1176,18 +1220,40 @@ def render_onroute_panel():
             depot_summary_df = compute_depot_summary(report_df, duty=duty_key)
             service_day_summary_df = compute_service_day_summary(report_df, duty=duty_key)
 
-            out_dir = scenario_output_dir(OUT_ROOT, installed_disp)
-            persist_scenario_artifacts(out_dir, assigned_events_df, report_df, profiles_df, assignment_summary_df)
+            out_dir = None
+            if save_scenario_outputs:
+                out_dir = scenario_output_dir(
+                    OUT_ROOT,
+                    installed_disp,
+                    scenario_key=scenario_key,
+                    collection_name=RUNTIME_SCENARIO_COLLECTION,
+                )
+                persist_scenario_artifacts(
+                    out_dir,
+                    assigned_events_df,
+                    report_df,
+                    profiles_df,
+                    assignment_summary_df,
+                    write_parquet=False,
+                    write_profiles=False,
+                )
+                prune_scenario_artifacts(
+                    OUT_ROOT,
+                    keep_latest=int(saved_scenarios_to_keep),
+                    collection_name=RUNTIME_SCENARIO_COLLECTION,
+                )
 
-            cache[scenario_key] = {
+            _remember_scenario(scenario_key, {
                 "assigned_events_df": assigned_events_df,
                 "report_df": report_df,
                 "profiles_df": profiles_df,
                 "assignment_summary_df": assignment_summary_df,
                 "depot_summary_df": depot_summary_df,
                 "service_day_summary_df": service_day_summary_df,
-                "out_dir": str(out_dir),
-            }
+                "out_dir": str(out_dir) if out_dir is not None else "",
+            })
+    else:
+        _touch_scenario_cache_key(scenario_key)
 
     data = cache[scenario_key]
     assigned_events_df = data["assigned_events_df"]
@@ -1195,6 +1261,29 @@ def render_onroute_panel():
     profiles_df = data["profiles_df"]
     assignment_summary_df = data["assignment_summary_df"]
     depot_summary_df = data["depot_summary_df"]
+    if save_scenario_outputs and not data.get("out_dir"):
+        out_dir = scenario_output_dir(
+            OUT_ROOT,
+            installed_disp,
+            scenario_key=scenario_key,
+            collection_name=RUNTIME_SCENARIO_COLLECTION,
+        )
+        persist_scenario_artifacts(
+            out_dir,
+            assigned_events_df,
+            report_df,
+            profiles_df,
+            assignment_summary_df,
+            write_parquet=False,
+            write_profiles=False,
+        )
+        prune_scenario_artifacts(
+            OUT_ROOT,
+            keep_latest=int(saved_scenarios_to_keep),
+            collection_name=RUNTIME_SCENARIO_COLLECTION,
+        )
+        data["out_dir"] = str(out_dir)
+
     depot_summary_df = add_depot_beb_distance_columns(report_df=report_df, depot_summary_df=depot_summary_df, duty=duty_key)
     service_day_summary_df = data["service_day_summary_df"]
 
@@ -1232,25 +1321,9 @@ def render_onroute_panel():
     o2.metric("On-route Success rate", f"{success_rate_onroute:.2f}%", delta=f"{success_rate_onroute - success_rate_depot:+.2f} pts")
     o3.metric("On-route BEB distance KM", f"{beb_km_onroute:,.1f}", delta=f"{beb_km_onroute - beb_km_depot:+,.1f}")
 
-    st.markdown("### Service day-level comparison")
+    st.markdown("### Depot x service day comparison")
 
-    fig_sd_blocks, fig_sd_rate, fig_sd_km = make_service_day_metric_charts(report_df, duty_key)
-
-    sd_top_c1, sd_top_c2 = st.columns(2)
-    with sd_top_c1:
-        st.plotly_chart(fig_sd_blocks, width="stretch")
-    with sd_top_c2:
-        st.plotly_chart(fig_sd_rate, width="stretch")
-
-    sd_bot_c1, sd_bot_c2 = st.columns(2)
-    with sd_bot_c1:
-        st.plotly_chart(fig_sd_km, width="stretch")
-    with sd_bot_c2:
-        st.empty()
-
-    st.markdown("### Depot-level comparison")
-
-    fig_blocks, fig_rate, fig_km = make_depot_metric_charts(report_df, duty_key)
+    fig_blocks, fig_rate, fig_km = make_depot_service_heatmaps(report_df, duty_key)
 
     top_c1, top_c2 = st.columns(2)
     with top_c1:
@@ -1449,4 +1522,3 @@ def render_onroute_panel():
                 st.dataframe(block_events_view, width="stretch", hide_index=True)
             else:
                 st.info("No assigned charging events for this block in the current scenario.")
-

@@ -6,13 +6,26 @@ import plotly.express as px
 from heapq import heappush, heappop
 from pathlib import Path
 
+from onroute_fcfs_helpers_update import (
+    build_final_proposed_dispensers,
+    load_candidate_stop_map,
+    parse_combined_sequence_json,
+    simulate_all_blocks_with_allocation_by_service_id,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUT_ROOT = PROJECT_ROOT / "data" / "processed"
 DATA_DIR = PROJECT_ROOT / "data" 
+GTFS_DIR = OUT_ROOT / "gtfs_bus_only"
 
 EVENTS_PATH = OUT_ROOT / "charging_opportunity_output.csv"
 DISPENSERS_PATH = OUT_ROOT / "final_proposed_dispensers.csv"
 SUMMARY_PATH = OUT_ROOT / "block_success_summary_on_route_charger_564kwh.csv"
+EVENTS_EXCLUDE_P1_PATH = OUT_ROOT / "charging_opportunity_output_exclude_p1.csv"
+DISPENSERS_EXCLUDE_P1_PATH = OUT_ROOT / "final_proposed_dispensers_exclude_p1.csv"
+SUMMARY_EXCLUDE_P1_PATH = OUT_ROOT / "block_success_summary_on_route_charger_564kwh_exclude_p1.csv"
+BLOCK_SUMMARY_PATH = OUT_ROOT / "block_success_summary_depot_only.parquet"
+CANDIDATE_STOP_MAP_PATH = OUT_ROOT / "candidate_stop_map.parquet"
 
 MIN_SESSION_MINUTES = 0
 BASE_DAY = pd.Timestamp("2026-01-20")
@@ -25,6 +38,205 @@ def _require_cols(df: pd.DataFrame, cols: set, name: str):
     missing = cols - set(df.columns)
     if missing:
         raise ValueError(f"{name} is missing required columns: {sorted(missing)}")
+
+
+def _filter_p1_blocks(blocks: pd.DataFrame, duty_key: str) -> pd.DataFrame:
+    success_col = f"{duty_key}_success_depot_only"
+    if success_col not in blocks.columns:
+        return blocks.copy()
+
+    success = (
+        blocks[success_col].eq(True)
+        | blocks[success_col].astype(str).str.upper().eq("SUCCESS")
+    )
+    return blocks.loc[~success].copy()
+
+
+def _load_blocks_for_export() -> pd.DataFrame:
+    blocks = pd.read_parquet(BLOCK_SUMMARY_PATH)
+    blocks = blocks[blocks["asset_class_new"] == "40-ft"].copy()
+    blocks["block_trips"] = blocks["combined_sequence_json"].apply(parse_combined_sequence_json)
+    blocks = blocks.rename(columns={
+        "medium_success": "medium_success_depot_only",
+        "heavy_success": "heavy_success_depot_only",
+    })
+    return blocks
+
+
+def _assigned_events_for_export(assigned_events: pd.DataFrame) -> pd.DataFrame:
+    assigned = assigned_events.copy()
+    if assigned.empty:
+        return assigned
+
+    if "dispenser_idx" in assigned.columns:
+        assigned = assigned.rename(columns={"dispenser_idx": "assigned_dispenser"})
+
+    sort_cols = [c for c in ["mode", "service_id", "candidate_name", "start_sec", "end_sec", "block_id"] if c in assigned.columns]
+    assigned = assigned.sort_values(sort_cols, kind="stable").reset_index(drop=True) if sort_cols else assigned.reset_index(drop=True)
+    assigned.insert(0, "opportunity_id", range(1, len(assigned) + 1))
+
+    output_cols = [
+        "opportunity_id",
+        "block_id",
+        "line_group",
+        "block_number",
+        "asset_class_new",
+        "depot_code",
+        "service_id",
+        "service_day",
+        "mode",
+        "prev_trip_id",
+        "next_trip_id",
+        "prev_route_short_name",
+        "next_route_short_name",
+        "prev_trip_end_stop_code",
+        "next_trip_start_stop_code",
+        "prev_trip_end_stop_name",
+        "next_trip_start_stop_name",
+        "stop_code",
+        "candidate_name",
+        "start_sec",
+        "end_sec",
+        "event_type",
+        "soc_start_pct",
+        "duration_sec",
+        "duration_min",
+        "soc_end_pct",
+        "charged_kwh",
+        "start_dt",
+        "end_dt",
+        "assigned",
+        "assigned_dispenser",
+    ]
+    return assigned[[c for c in output_cols if c in assigned.columns]].copy()
+
+
+def _summary_for_export(blocks: pd.DataFrame, medium_report: pd.DataFrame, heavy_report: pd.DataFrame) -> pd.DataFrame:
+    summary = blocks.copy()
+
+    rename_base = {
+        "total_energy_medium_kwh": "total_energy_require_medium_kwh",
+        "total_energy_heavy_kwh": "total_energy_require_heavy_kwh",
+        "soc_left_medium_percent": "soc_left_medium_percent_depot_only",
+        "soc_left_heavy_percent": "soc_left_heavy_percent_depot_only",
+    }
+    summary = summary.rename(columns=rename_base)
+
+    medium_cols = [
+        "block_id",
+        "soc_left_medium_percent_on_route_charge",
+        "medium_success_on_route_charge",
+        "total_energy_received_medium",
+    ]
+    heavy_cols = [
+        "block_id",
+        "soc_left_heavy_percent_on_route_charge",
+        "heavy_success_on_route_charge",
+        "total_energy_received_heavy",
+    ]
+
+    if not medium_report.empty:
+        summary = summary.merge(
+            medium_report[[c for c in medium_cols if c in medium_report.columns]],
+            on="block_id",
+            how="left",
+        )
+    if not heavy_report.empty:
+        summary = summary.merge(
+            heavy_report[[c for c in heavy_cols if c in heavy_report.columns]],
+            on="block_id",
+            how="left",
+        )
+
+    output_cols = [
+        "block_id",
+        "line_group",
+        "block_number",
+        "service_id",
+        "service_day",
+        "depot_code",
+        "asset_class",
+        "asset_class_new",
+        "total_distance_km",
+        "total_energy_require_medium_kwh",
+        "total_energy_require_heavy_kwh",
+        "avg_kwh_per_km_medium",
+        "avg_kwh_per_km_heavy",
+        "soc_left_medium_percent_depot_only",
+        "soc_left_heavy_percent_depot_only",
+        "medium_success_depot_only",
+        "heavy_success_depot_only",
+        "soc_left_medium_percent_on_route_charge",
+        "medium_success_on_route_charge",
+        "soc_left_heavy_percent_on_route_charge",
+        "heavy_success_on_route_charge",
+        "total_energy_received_medium",
+        "total_energy_received_heavy",
+    ]
+    return summary[[c for c in output_cols if c in summary.columns]].copy()
+
+
+@st.cache_data(show_spinner=False)
+def _ensure_exclude_p1_outputs() -> tuple[str, str, str]:
+    paths = (EVENTS_EXCLUDE_P1_PATH, DISPENSERS_EXCLUDE_P1_PATH, SUMMARY_EXCLUDE_P1_PATH)
+    if all(path.exists() for path in paths):
+        return tuple(str(path) for path in paths)
+
+    blocks = _load_blocks_for_export()
+    candidate_df = load_candidate_stop_map(CANDIDATE_STOP_MAP_PATH)
+
+    heavy_blocks = _filter_p1_blocks(blocks, "heavy")
+    medium_blocks = _filter_p1_blocks(blocks, "medium")
+
+    heavy_events, disp_final = build_final_proposed_dispensers(
+        blocks_df=heavy_blocks,
+        candidate_df=candidate_df,
+        gtfs_dir=GTFS_DIR,
+        mode="heavy",
+    )
+    medium_events, _ = build_final_proposed_dispensers(
+        blocks_df=medium_blocks,
+        candidate_df=candidate_df,
+        gtfs_dir=GTFS_DIR,
+        mode="medium",
+    )
+
+    proposed_map = (
+        dict(zip(disp_final["candidate_name"], disp_final["final_proposed_dispensers"]))
+        if not disp_final.empty
+        else {}
+    )
+
+    heavy_assigned, heavy_report, _ = simulate_all_blocks_with_allocation_by_service_id(
+        blocks_df=blocks,
+        events_df=heavy_events,
+        installed_disp=proposed_map,
+        mode="heavy",
+    )
+    medium_assigned, medium_report, _ = simulate_all_blocks_with_allocation_by_service_id(
+        blocks_df=blocks,
+        events_df=medium_events,
+        installed_disp=proposed_map,
+        mode="medium",
+    )
+
+    charging_output = pd.concat(
+        [
+            _assigned_events_for_export(heavy_assigned),
+            _assigned_events_for_export(medium_assigned),
+        ],
+        ignore_index=True,
+    )
+    if not charging_output.empty:
+        charging_output["opportunity_id"] = range(1, len(charging_output) + 1)
+
+    summary_output = _summary_for_export(blocks, medium_report, heavy_report)
+
+    charging_output.to_csv(EVENTS_EXCLUDE_P1_PATH, index=False)
+    disp_final.to_csv(DISPENSERS_EXCLUDE_P1_PATH, index=False)
+    summary_output.to_csv(SUMMARY_EXCLUDE_P1_PATH, index=False)
+
+    return tuple(str(path) for path in paths)
 
 
 def _attach_block_category(events_df: pd.DataFrame, block_df: pd.DataFrame) -> pd.DataFrame:
@@ -338,19 +550,45 @@ def _render_service_day_map(service_day: str):
 
 
 def render_dispenser_explorer_panel():
-    events_df = pd.read_csv(EVENTS_PATH)
-    disp_df = pd.read_csv(DISPENSERS_PATH)
-    block_df = pd.read_csv(SUMMARY_PATH)
+    # =========================
+    # Sidebar filters
+    # =========================
+    st.sidebar.header("Scenario filters")
+    p1_scope = st.sidebar.radio(
+        "P1 block handling",
+        ["Exclude P1 blocks", "Include P1 blocks"],
+        index=0,
+        horizontal=True,
+        key="dispenser_p1_scope",
+    )
+    exclude_p1 = p1_scope.startswith("Exclude")
+    p1_scope_key = "exclude_p1" if exclude_p1 else "include_p1"
+
+    if exclude_p1:
+        try:
+            with st.spinner("Preparing exclude-P1 dispenser explorer outputs."):
+                _ensure_exclude_p1_outputs()
+        except Exception as exc:
+            st.error(f"Could not prepare exclude-P1 output files: {exc}")
+            st.stop()
+
+    events_path = EVENTS_EXCLUDE_P1_PATH if exclude_p1 else EVENTS_PATH
+    dispensers_path = DISPENSERS_EXCLUDE_P1_PATH if exclude_p1 else DISPENSERS_PATH
+    summary_path = SUMMARY_EXCLUDE_P1_PATH if exclude_p1 else SUMMARY_PATH
+
+    events_df = pd.read_csv(events_path)
+    disp_df = pd.read_csv(dispensers_path)
+    block_df = pd.read_csv(summary_path)
 
     _require_cols(
         events_df,
         {"candidate_name", "start_sec", "end_sec", "block_id", "service_day", "mode", "assigned"},
-        "charging_opportunity_output"
+        events_path.name,
     )
     _require_cols(
         disp_df,
         {"candidate_name", "final_proposed_dispensers"},
-        "final_proposed_dispensers"
+        dispensers_path.name,
     )
 
     events_df = events_df.copy()
@@ -370,11 +608,6 @@ def render_dispenser_explorer_panel():
 
     events_df = _attach_block_category(events_df, block_df)
 
-    # =========================
-    # Sidebar filters
-    # =========================
-    st.sidebar.header("Scenario filters")
-
     mode_options = sorted(events_df["mode"].dropna().unique().tolist())
     sel_mode = st.sidebar.selectbox("Duty mode", mode_options, index=0)
 
@@ -386,10 +619,12 @@ def render_dispenser_explorer_panel():
         "P2 blocks (depot fail on-route success)",
         "P3 blocks (both fail)",
     ]
+    default_categories = category_options[1:] if exclude_p1 else category_options
     sel_categories = st.sidebar.multiselect(
         "Block categories",
         options=category_options,
-        default=category_options,
+        default=default_categories,
+        key=f"dispenser_categories_{p1_scope_key}",
     )
 
     show_assigned_only = st.sidebar.checkbox("Assigned sessions only", value=False)
@@ -454,6 +689,7 @@ def render_dispenser_explorer_panel():
 
     st.caption(
         f"Mode: {sel_mode} | Service day: {sel_service_day} | "
+        f"P1 handling: {p1_scope} | "
         f"Categories: {', '.join(sel_categories) if sel_categories else 'None'}"
     )
 
@@ -725,7 +961,7 @@ def render_dispenser_explorer_panel():
     st.markdown(f"### Raw charging-session records ({raw_scope.lower()})")
     st.caption(
         f"{raw_scope_note} | Candidate: {sel_candidate} | Mode: {sel_mode} | "
-        f"Service day: {sel_service_day} | "
+        f"Service day: {sel_service_day} | P1 handling: {p1_scope} | "
         f"Categories: {', '.join(sel_categories) if sel_categories else 'None'}"
     )
     if raw_events.empty:

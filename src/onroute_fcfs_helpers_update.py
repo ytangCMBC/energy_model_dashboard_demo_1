@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import math
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -243,23 +244,52 @@ def build_final_proposed_dispensers(
     saturday_events, saturday_disp = build_events_for_service_id(blocks_df, candidate_df, gtfs_dir, 2, mode=mode)
     sunday_events, sunday_disp = build_events_for_service_id(blocks_df, candidate_df, gtfs_dir, 3, mode=mode)
 
-    weekday_disp = weekday_disp.rename(columns={"dispensers_needed": "weekday_dispensers_needed"})
-    saturday_disp = saturday_disp.rename(columns={"dispensers_needed": "saturday_dispensers_needed"})
-    sunday_disp = sunday_disp.rename(columns={"dispensers_needed": "sunday_dispensers_needed"})
+    service_columns = ["dispensers_needed", "num_sessions", "num_unique_blocks"]
+
+    def normalize_service_disp(disp: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        out = disp.copy()
+        if "candidate_name" not in out.columns:
+            out["candidate_name"] = pd.Series(dtype=str)
+        for col in service_columns:
+            if col not in out.columns:
+                out[col] = 0
+        out = out[["candidate_name", *service_columns]].copy()
+        return out.rename(columns={col: f"{prefix}_{col}" for col in service_columns})
+
+    weekday_disp = normalize_service_disp(weekday_disp, "weekday")
+    saturday_disp = normalize_service_disp(saturday_disp, "saturday")
+    sunday_disp = normalize_service_disp(sunday_disp, "sunday")
 
     disp_final = (
-        weekday_disp[["candidate_name", "weekday_dispensers_needed"]]
-        .merge(saturday_disp[["candidate_name", "saturday_dispensers_needed"]], on="candidate_name", how="outer")
-        .merge(sunday_disp[["candidate_name", "sunday_dispensers_needed"]], on="candidate_name", how="outer")
+        weekday_disp
+        .merge(saturday_disp, on="candidate_name", how="outer")
+        .merge(sunday_disp, on="candidate_name", how="outer")
         .fillna(0)
     )
 
-    for c in ["weekday_dispensers_needed", "saturday_dispensers_needed", "sunday_dispensers_needed"]:
+    count_cols = [
+        f"{prefix}_{col}"
+        for prefix in ["weekday", "saturday", "sunday"]
+        for col in service_columns
+    ]
+    for c in count_cols:
         disp_final[c] = disp_final[c].astype(int)
+
+    def _proposal_driver(row: pd.Series) -> str:
+        day_cols = [
+            ("Weekday", "weekday_dispensers_needed"),
+            ("Saturday", "saturday_dispensers_needed"),
+            ("Sunday", "sunday_dispensers_needed"),
+        ]
+        max_needed = int(max(row[col] for _, col in day_cols))
+        if max_needed <= 0:
+            return "None"
+        return "/".join(label for label, col in day_cols if int(row[col]) == max_needed)
 
     disp_final["final_proposed_dispensers"] = disp_final[
         ["weekday_dispensers_needed", "saturday_dispensers_needed", "sunday_dispensers_needed"]
     ].max(axis=1)
+    disp_final["proposal_driver"] = disp_final.apply(_proposal_driver, axis=1)
 
     event_columns = [
         "block_id", "mode", "line_group", "block_number", "asset_class_new",
@@ -1282,12 +1312,36 @@ def compute_service_day_summary(block_inv: pd.DataFrame, duty: str | None = None
 
 
 
-def scenario_output_dir(base_dir: str | Path, installed_disp: Dict[str, int]) -> Path:
+def scenario_output_dir(
+    base_dir: str | Path,
+    installed_disp: Dict[str, int],
+    scenario_key: str | None = None,
+    collection_name: str = "onroute_fcfs_scenarios",
+) -> Path:
     base_dir = Path(base_dir)
-    key = _hash_dict(installed_disp)
-    out_dir = base_dir / "onroute_fcfs_scenarios" / key
+    key = scenario_key or _hash_dict(installed_disp)
+    out_dir = base_dir / collection_name / key
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def prune_scenario_artifacts(
+    base_dir: str | Path,
+    keep_latest: int = 10,
+    collection_name: str = "onroute_fcfs_scenarios",
+) -> int:
+    root = Path(base_dir) / collection_name
+    if keep_latest < 1 or not root.exists():
+        return 0
+
+    scenario_dirs = [p for p in root.iterdir() if p.is_dir()]
+    scenario_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    removed = 0
+    for path in scenario_dirs[keep_latest:]:
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 
@@ -1297,6 +1351,8 @@ def persist_scenario_artifacts(
     report_df: pd.DataFrame,
     profiles_df: pd.DataFrame,
     assignment_summary_df: pd.DataFrame,
+    write_parquet: bool = True,
+    write_profiles: bool = True,
 ):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1305,7 +1361,8 @@ def persist_scenario_artifacts(
     # 1. Assigned events
     # -------------------------------
     if assigned_events_df is not None and not assigned_events_df.empty:
-        assigned_events_df.to_parquet(out_dir / "assigned_events.parquet", index=False)
+        if write_parquet:
+            assigned_events_df.to_parquet(out_dir / "assigned_events.parquet", index=False)
         assigned_events_df.to_csv(out_dir / "assigned_events.csv", index=False)
     else:
         pd.DataFrame().to_csv(out_dir / "assigned_events.csv", index=False)
@@ -1325,13 +1382,14 @@ def persist_scenario_artifacts(
         )
         report_to_save = report_to_save.drop(columns=["block_trips"])
 
-    report_to_save.to_parquet(out_dir / "block_report.parquet", index=False)
+    if write_parquet:
+        report_to_save.to_parquet(out_dir / "block_report.parquet", index=False)
     report_to_save.to_csv(out_dir / "block_report.csv", index=False)
 
     # -------------------------------
     # 3. Profiles
     # -------------------------------
-    if profiles_df is not None and not profiles_df.empty:
+    if write_profiles and profiles_df is not None and not profiles_df.empty:
         profiles_to_save = profiles_df.copy()
 
         if "block_trips" in profiles_to_save.columns:
@@ -1342,16 +1400,18 @@ def persist_scenario_artifacts(
             )
             profiles_to_save = profiles_to_save.drop(columns=["block_trips"])
 
-        profiles_to_save.to_parquet(out_dir / "profiles.parquet", index=False)
+        if write_parquet:
+            profiles_to_save.to_parquet(out_dir / "profiles.parquet", index=False)
         profiles_to_save.to_csv(out_dir / "profiles.csv", index=False)
-    else:
+    elif write_profiles:
         pd.DataFrame().to_csv(out_dir / "profiles.csv", index=False)
 
     # -------------------------------
     # 4. Assignment summary
     # -------------------------------
     if assignment_summary_df is not None and not assignment_summary_df.empty:
-        assignment_summary_df.to_parquet(out_dir / "assignment_summary.parquet", index=False)
+        if write_parquet:
+            assignment_summary_df.to_parquet(out_dir / "assignment_summary.parquet", index=False)
         assignment_summary_df.to_csv(out_dir / "assignment_summary.csv", index=False)
     else:
         pd.DataFrame().to_csv(out_dir / "assignment_summary.csv", index=False)

@@ -1,0 +1,37 @@
+candidate_name,weekday_dispensers_needed,weekday_num_sessions,weekday_num_unique_blocks,saturday_dispensers_needed,saturday_num_sessions,saturday_num_unique_blocks,sunday_dispensers_needed,sunday_num_sessions,sunday_num_unique_blocks,final_proposed_dispensers,proposal_driver
+22nd Street Station,7,226,49,5,190,35,7,239,33,7,Weekday/Sunday
+Braid Station,4,119,27,4,97,24,3,58,12,4,Weekday/Saturday
+Brentwood Station,2,61,17,1,37,10,1,58,6,2,Weekday
+Bridgeport Station,2,79,17,4,83,24,4,88,29,4,Saturday/Sunday
+Burquitlam Station,2,31,10,1,20,4,1,21,4,2,Weekday
+Burrard Station,2,44,23,1,22,10,1,20,11,2,Weekday
+Capilano University,2,38,3,1,26,1,1,22,1,2,Weekday
+Carvolth Exchange,1,19,8,0,0,0,0,0,0,1,Weekday
+Coquitlam Central Station,5,183,38,6,177,29,5,144,27,6,Saturday
+Dunbar Loop,1,5,1,1,43,7,1,53,8,1,Weekday/Saturday/Sunday
+Edmonds Station,4,181,42,4,159,27,4,117,20,4,Weekday/Saturday/Sunday
+Haney Place,2,30,12,1,21,8,1,19,8,2,Weekday
+Joyce Station,3,64,14,2,69,14,2,53,10,3,Weekday
+King George Station,1,26,16,0,0,0,0,0,0,1,Weekday
+Kootenay Loop,3,103,30,2,79,19,2,67,19,3,Weekday
+Ladner Exchange,2,47,10,1,21,4,1,29,6,2,Weekday
+Langley Centre,6,231,70,7,241,59,5,196,49,7,Saturday
+Lonsdale Quay,4,102,23,3,91,25,3,79,22,4,Weekday
+Lougheed Station,4,125,31,3,91,15,3,80,18,4,Weekday
+Marine Drive Station,2,29,6,2,53,8,2,48,9,2,Weekday/Saturday/Sunday
+Marpole Loop,2,72,8,2,75,9,1,74,9,2,Weekday/Saturday
+Metrotown Station,6,241,53,6,213,37,6,168,28,6,Weekday/Saturday/Sunday
+Moody Centre Station,2,16,10,0,0,0,0,0,0,2,Weekday
+New Westminster Station,4,120,21,3,133,20,3,93,19,4,Weekday
+Newton Exchange,5,215,71,7,260,52,7,245,63,7,Saturday/Sunday
+Northbound Knight St Bridge Offramp,2,34,10,2,39,11,2,22,13,2,Weekday/Saturday/Sunday
+Park Royal,0,0,0,1,6,1,0,0,0,1,Saturday
+Phibbs Exchange,6,141,31,4,119,28,4,84,19,6,Weekday
+Port Coquitlam Station,3,70,18,2,65,18,2,61,16,3,Weekday
+Richmond-Brighouse Station,4,150,22,4,145,30,3,138,25,4,Weekday/Saturday
+SFU Transit Exchange,1,43,14,2,66,14,2,66,9,2,Saturday/Sunday
+Scott Road Station,5,168,41,4,105,14,3,103,12,5,Weekday
+Scottsdale Exchange,4,94,33,3,92,23,4,103,23,4,Weekday/Sunday
+Surrey Central Station,10,437,98,11,520,101,11,444,81,11,Saturday/Sunday
+Tsawwassen Ferry Terminal,0,0,0,2,17,4,3,35,6,3,Sunday
+UBC Exchange,3,54,17,1,27,6,1,17,4,3,Weekday
