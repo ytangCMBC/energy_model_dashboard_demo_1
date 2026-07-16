@@ -45,6 +45,25 @@ RUNTIME_SCENARIO_COLLECTION = "onroute_fcfs_runtime_scenarios"
 MAX_SESSION_SCENARIOS = 3
 MAX_SAVED_SCENARIOS = 10
 
+def inject_scrollable_dropdown_css():
+    st.markdown(
+        """
+        <style>
+        div[data-baseweb="popover"] {
+            max-height: 52vh !important;
+            overflow-y: auto !important;
+        }
+        div[data-baseweb="popover"] [role="listbox"],
+        div[data-baseweb="popover"] [data-baseweb="menu"] {
+            max-height: 48vh !important;
+            overflow-y: auto !important;
+            overscroll-behavior: contain;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 @st.cache_data(show_spinner=False, max_entries=1)
 def load_block_summary(path: str | Path) -> pd.DataFrame:
     df = pd.read_parquet(path)
@@ -1087,6 +1106,7 @@ def add_depot_beb_distance_columns(
 
 def render_onroute_panel():
     st.markdown("## On-Route Charge Summary Panel")
+    inject_scrollable_dropdown_css()
 
     if "fcfs_scenario_cache" not in st.session_state:
         _clear_scenario_memory()
@@ -1430,21 +1450,40 @@ def render_onroute_panel():
     st.markdown("### Block drill-down")
     with st.sidebar:
         st.markdown("---")
+        st.subheader("Block drill-down")
         success_col = f"{duty_key}_success_on_route_charge"
         depot_options = sorted(report_df["depot_code"].dropna().astype(str).unique().tolist())
-        depot = st.selectbox("Depot", depot_options) if depot_options else None
+        depot = st.selectbox("Depot", depot_options, key="onroute_drill_depot") if depot_options else None
         df1 = report_df[report_df["depot_code"].astype(str) == str(depot)] if depot is not None else report_df.copy()
-        status_label = st.radio("On-route FCFS result", ["Success", "Failure"], index=0, horizontal=True)
+        status_label = st.radio(
+            "On-route FCFS result",
+            ["Success", "Failure"],
+            index=0,
+            horizontal=True,
+            key="onroute_drill_status",
+        )
         status_value = "SUCCESS" if status_label == "Success" else "FAILURE"
         df2 = df1[df1[success_col] == status_value].copy()
         service_day_options = sorted(df2["service_day"].dropna().unique().tolist())
-        service_day = st.selectbox("Service day", service_day_options) if service_day_options else None
+        service_day = st.selectbox(
+            "Service day",
+            service_day_options,
+            key="onroute_drill_service_day",
+        ) if service_day_options else None
         df3 = df2[df2["service_day"] == service_day].copy() if service_day is not None else df2
         lg_options = sorted(pd.to_numeric(df3["line_group"], errors="coerce").dropna().astype(int).unique().tolist())
-        line_group = st.selectbox("Line group", lg_options) if lg_options else None
+        line_group = st.selectbox(
+            "Line group",
+            lg_options,
+            key="onroute_drill_line_group",
+        ) if lg_options else None
         df4 = df3[pd.to_numeric(df3["line_group"], errors="coerce").astype("Int64") == int(line_group)] if line_group is not None else df3
         block_options = sorted(pd.to_numeric(df4["block_number"], errors="coerce").dropna().astype(int).unique().tolist())
-        block_number = st.selectbox("Block number", block_options) if block_options else None
+        block_number = st.selectbox(
+            "Block number",
+            block_options,
+            key="onroute_drill_block_number",
+        ) if block_options else None
 
     if block_number is not None and not df4.empty:
         df5 = df4[pd.to_numeric(df4["block_number"], errors="coerce").astype("Int64") == int(block_number)].copy()
