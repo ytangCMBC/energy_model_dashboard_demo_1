@@ -902,7 +902,7 @@ def render_block_panel():
             initial_view_state=view_state,
             map_style=None,
         ),
-        use_container_width=True,
+        width="stretch",
         height=560,
     )
 
@@ -1166,7 +1166,7 @@ def render_block_panel():
             gridcolor="rgba(0,0,0,0.05)",
         )
 
-        st.plotly_chart(fig, use_container_width=False)
+        st.plotly_chart(fig, width="content")
     else:
         st.info("Elevation profile unavailable for this trip.", icon="ℹ️")
 
@@ -1241,7 +1241,7 @@ def render_block_panel():
             gridcolor="rgba(0,0,0,0.05)",
         )
 
-        st.plotly_chart(fig_e, use_container_width=False)
+        st.plotly_chart(fig_e, width="content")
     else:
         st.info("Simulation energy profile unavailable for this trip.", icon="ℹ️")
 
@@ -1314,7 +1314,7 @@ def render_block_panel():
             gridcolor="rgba(0,0,0,0.05)",
         )
 
-        st.plotly_chart(fig_s, use_container_width=False)
+        st.plotly_chart(fig_s, width="content")
     else:
         st.info("SOC profile unavailable for this trip.", icon="ℹ️")
 

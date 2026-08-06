@@ -7,3 +7,4 @@ streamlit-folium
 pyarrow
 scipy
 matplotlib
+openpyxl

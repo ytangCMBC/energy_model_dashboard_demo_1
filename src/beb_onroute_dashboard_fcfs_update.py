@@ -437,7 +437,7 @@ def make_depot_service_heatmaps(report_df: pd.DataFrame, duty: str):
         [1.00, "#2f6f3e"],
     ]
 
-    def build_heatmap(metric: str, title: str, colorbar_title: str, text_format: str, text_suffix: str = ""):
+    def build_heatmap(metric: str, colorbar_title: str, text_format: str, text_suffix: str = ""):
         z = matrix_for(metric)
         text = [[f"{format(v, text_format)}{text_suffix}" for v in row] for row in z]
         fig = go.Figure(
@@ -454,11 +454,10 @@ def make_depot_service_heatmaps(report_df: pd.DataFrame, duty: str):
             )
         )
         fig.update_layout(
-            title=title,
             xaxis_title="Service day",
             yaxis_title="Depot",
             height=max(360, 110 + 32 * len(depots)),
-            margin=dict(l=10, r=10, t=55, b=10),
+            margin=dict(l=10, r=10, t=16, b=10),
             paper_bgcolor="white",
             plot_bgcolor="white",
         )
@@ -466,20 +465,17 @@ def make_depot_service_heatmaps(report_df: pd.DataFrame, duty: str):
 
     fig_blocks = build_heatmap(
         "unlocked_blocks",
-        f"Unlocked Blocks by Depot and Service Day (Blocks, {duty.capitalize()} duty)",
         "Blocks",
         "+.0f",
     )
     fig_rate = build_heatmap(
         "success_rate_delta",
-        f"Success Rate Improvement by Depot and Service Day (%, {duty.capitalize()} duty)",
         "%",
         "+.1f",
         "%",
     )
     fig_km = build_heatmap(
         "beb_km_delta",
-        f"BEB Distance Improvement by Depot and Service Day (KM, {duty.capitalize()} duty)",
         "KM",
         "+.0f",
         " KM",
@@ -1347,12 +1343,15 @@ def render_onroute_panel():
 
     top_c1, top_c2 = st.columns(2)
     with top_c1:
+        st.markdown(f"#### Unlocked blocks (Blocks, {duty_key.capitalize()} duty)")
         st.plotly_chart(fig_blocks, width="stretch")
     with top_c2:
+        st.markdown(f"#### Success rate improvement (%, {duty_key.capitalize()} duty)")
         st.plotly_chart(fig_rate, width="stretch")
 
     bot_c1, bot_c2 = st.columns(2)
     with bot_c1:
+        st.markdown(f"#### BEB distance improvement (KM, {duty_key.capitalize()} duty)")
         st.plotly_chart(fig_km, width="stretch")
     with bot_c2:
         st.empty()

@@ -342,13 +342,12 @@ def render_trip_panel():
     # ===== Cursor UI BETWEEN MAP AND KPI =====
     dmin = float(elev_df["dist_m"].min()) / 1000.0
     dmax = float(elev_df["dist_m"].max()) / 1000.0
-    _ = st.slider(
+    st.slider(
         "Move Dot (Distance along route, km)",
         min_value=round(dmin, 3),
         max_value=round(dmax, 3),
-        value=round(float(st.session_state["cursor_km"]), 3),
         step=0.001,
-        key="cursor_km",   # <- Streamlit writes the value here
+        key="cursor_km",
     )
     # After user moves the slider, recompute derived values
     compute_cursor_derived(elev_df, key="cursor")
@@ -440,7 +439,7 @@ def render_trip_panel():
             height=320
         )
         fig2.update_layout(showlegend=False)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     with col2:
         st.subheader("Elevation vs Distance")
@@ -479,7 +478,7 @@ def render_trip_panel():
         )
         fig.update_layout(showlegend=False)
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # ---------------------------
     # Time Series (Speed, Grade, SOC) — NOW VS DISTANCE
@@ -570,7 +569,7 @@ def render_trip_panel():
                     height=320,
                     showlegend=False
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         with col2:
             st.subheader("Grade vs Distance")
@@ -607,7 +606,7 @@ def render_trip_panel():
                     height=320,
                     showlegend=False
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         st.subheader("SOC vs Distance")
         if "soc" in ts_df.columns and "dist_km" in ts_df.columns:
@@ -642,7 +641,7 @@ def render_trip_panel():
                 margin=dict(l=30, r=10, t=30, b=30),
                 height=320,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
     else:
         st.info(f"No timeseries parquet found for shape {sid} ({duty}).")
 

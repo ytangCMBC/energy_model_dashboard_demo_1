@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 import plotly.express as px
 from heapq import heappush, heappop
 from pathlib import Path
@@ -539,8 +538,7 @@ def _render_service_day_map(service_day: str):
         )
         return
 
-    html = map_path.read_text(encoding="utf-8")
-    components.html(html, height=700, scrolling=True)
+    st.iframe(map_path, height=700, width="stretch")
 
 
 
